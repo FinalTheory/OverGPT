@@ -9,6 +9,7 @@ services:
     working_dir: /opt/workspace/mymcp
     command: ["python", "server.py"]
     environment:
+      MCP_PROJECT_ROOT: /opt/workspace/mymcp
       MCP_WORKSPACE_ROOT: /opt/workspace
       MCP_SKILLS_DIRNAME: skills
       MCP_DRAFT_DIRNAME: draft
@@ -19,6 +20,7 @@ services:
       MCP_MAX_TIMEOUT: "120"
       MCP_MAX_OUTPUT_CHARS: "50000"
       MCP_MAX_READ_CHARS: "200000"
+      MCP_RESTART_DELAY: "2"
     volumes:
       - /home/god/Dropbox/workspace:/opt/workspace:rw
       - /home/god/Dropbox/Blog:/opt/Blog:r

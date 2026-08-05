@@ -13,6 +13,7 @@
 - `read_workspace_file`：读取共享目录内的文本文件
 - `write_workspace_file`：原子写入共享目录内的文本文件
 - `render_diff_html`：把 `draft` 仓库的完整 word-diff 作为 `draft-diff.html` 文件返回
+- `restart_mcp_server`：校验修改后的 Python 代码，然后退出并由 Docker 自动拉起
 - `run_workspace_code`：在容器中运行 Python 或 Shell
 
 所有客户端路径都相对于共享目录，例如 `draft/demo.md`。服务会拒绝绝对路径和
@@ -34,6 +35,11 @@ make down
 容器内代码目录是 `/opt/workspace/mymcp`，它来自宿主机共享目录的直接挂载。
 修改 `.py` 文件后执行 `make restart` 即可，无需重新构建镜像；只有
 `requirements.txt` 或 `Dockerfile` 改变时才需要 `make build`。
+
+Compose 使用 `restart: unless-stopped`，且宿主机 Docker 服务已设置为开机启动，
+所以 VPS 或 Docker 重启后会自动恢复 MCP。GPT 修改 `mymcp` 内的 Python 后，可以调用
+`restart_mcp_server` 热加载新代码；该工具会先在新 Python 进程中执行导入校验，避免
+明显的语法或导入错误触发无休止的重启循环。
 
 本机 endpoint: `http://127.0.0.1:8765/mcp`
 

@@ -6,6 +6,7 @@ import html
 import os
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Literal
 
@@ -287,6 +288,34 @@ def render_diff_html(paths: list[str] | None = None) -> CallToolResult:
             )
         ]
     )
+
+
+@mcp.tool()
+def restart_mcp_server() -> dict[str, Any]:
+    """Reload modified MCP Python code by safely restarting this Docker container.
+
+    Call this after changing Python files in mymcp. The tool first imports the updated
+    server in a fresh Python process. If validation succeeds, it returns a response and
+    then exits; Docker's restart policy starts it again. This does not rebuild the image,
+    so dependency, requirements.txt, Dockerfile, or Compose changes need host deployment.
+    """
+    if not Path("/.dockerenv").exists():
+        raise RuntimeError("self-restart is only available inside Docker")
+
+    _run_checked(
+        ["python", "-c", "import server"],
+        CONFIG.project_root,
+    )
+
+    timer = threading.Timer(CONFIG.restart_delay_seconds, os._exit, args=(0,))
+    timer.daemon = True
+    timer.start()
+    return {
+        "status": "restarting",
+        "validated": True,
+        "delay_seconds": CONFIG.restart_delay_seconds,
+        "message": "Updated Python code validated; reconnect after the container restarts.",
+    }
 
 
 @mcp.tool()

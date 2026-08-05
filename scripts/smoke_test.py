@@ -22,6 +22,7 @@ async def main(url: str) -> None:
                 "load_skill",
                 "read_workspace_file",
                 "render_diff_html",
+                "restart_mcp_server",
                 "write_workspace_file",
                 "run_workspace_code",
             }
