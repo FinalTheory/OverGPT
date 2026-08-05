@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+.mcp-smoke-test.md
+assets/
+.DS_Store

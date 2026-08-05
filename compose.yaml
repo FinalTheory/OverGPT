@@ -1,0 +1,33 @@
+services:
+  mcp:
+    build:
+      context: .
+    container_name: writing-workspace-mcp
+    restart: unless-stopped
+    init: true
+    user: "1000:1000"
+    working_dir: /opt/workspace/mymcp
+    command: ["python", "server.py"]
+    environment:
+      MCP_WORKSPACE_ROOT: /opt/workspace
+      MCP_SKILLS_DIRNAME: skills
+      MCP_DRAFT_DIRNAME: draft
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "8765"
+      MCP_PATH: /mcp
+      MCP_DEFAULT_TIMEOUT: "30"
+      MCP_MAX_TIMEOUT: "120"
+      MCP_MAX_OUTPUT_CHARS: "50000"
+      MCP_MAX_READ_CHARS: "200000"
+    volumes:
+      - /home/god/Dropbox/workspace:/opt/workspace:rw
+      - /home/god/Dropbox/Blog:/opt/Blog:r
+    ports:
+      - "127.0.0.1:8765:8765"
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
