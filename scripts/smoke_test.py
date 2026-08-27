@@ -7,7 +7,6 @@ import sys
 
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
-from mcp.types import EmbeddedResource, TextResourceContents
 
 
 async def main(url: str) -> None:
@@ -21,7 +20,6 @@ async def main(url: str) -> None:
                 "list_draft_articles",
                 "load_skill",
                 "read_workspace_file",
-                "render_diff_html",
                 "restart_mcp_server",
                 "write_workspace_file",
                 "run_workspace_code",
@@ -33,10 +31,6 @@ async def main(url: str) -> None:
             skills = await session.call_tool("list_skills", {})
             articles = await session.call_tool("list_draft_articles", {})
             loaded = await session.call_tool("load_skill", {"name": "red"})
-            rendered_diff = await session.call_tool(
-                "render_diff_html",
-                {"paths": ["draft/2026-04/casi-snow.md"]},
-            )
             written = await session.call_tool(
                 "write_workspace_file",
                 {
@@ -57,7 +51,6 @@ async def main(url: str) -> None:
                 "list_skills": skills,
                 "list_draft_articles": articles,
                 "load_skill": loaded,
-                "render_diff_html": rendered_diff,
                 "write_workspace_file": written,
                 "read_workspace_file": read_back,
                 "run_workspace_code": executed,
@@ -75,17 +68,6 @@ async def main(url: str) -> None:
                 raise RuntimeError(f"draft paths are not workspace-relative: {article_paths}")
             print("workspace-relative draft paths:", True)
             print("loaded red skill:", "小红书深度入口文章写作" in loaded.content[0].text)
-            diff_file = rendered_diff.content[0]
-            if not isinstance(diff_file, EmbeddedResource):
-                raise RuntimeError(f"render_diff_html did not return a file: {diff_file}")
-            if not isinstance(diff_file.resource, TextResourceContents):
-                raise RuntimeError(f"render_diff_html returned a non-text file: {diff_file.resource}")
-            print(
-                "rendered diff file:",
-                str(diff_file.resource.uri).endswith("/draft-diff.html")
-                and diff_file.resource.mimeType == "text/html"
-                and "<!doctype html>" in diff_file.resource.text,
-            )
             print("file round trip:", "写入成功" in read_back.content[0].text)
             print("python execution:", "python execution ok" in executed.content[0].text)
             cleaned = await session.call_tool(

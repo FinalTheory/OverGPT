@@ -12,15 +12,18 @@
 - `load_skill`：加载完整的 `SKILL.md`
 - `read_workspace_file`：读取共享目录内的文本文件
 - `write_workspace_file`：原子写入共享目录内的文本文件
-- `render_diff_html`：把 `draft` 仓库的完整 word-diff 作为 `draft-diff.html` 文件返回
 - `restart_mcp_server`：校验修改后的 Python 代码，然后退出并由 Docker 自动拉起
 - `run_workspace_code`：在容器中运行 Python 或 Shell
 
 所有客户端路径都相对于共享目录，例如 `draft/demo.md`。服务会拒绝绝对路径和
 `../` 目录逃逸。
 
-`render_diff_html.paths` 同时接受 `draft/demo.md` 和 `demo.md`；前者会在安全校验前
-移除开头的 `draft/`。
+## Draft Diff 网页
+
+访问 `/diff/` 可按 `draft` 的目录结构浏览相对 `HEAD` 有改动的文件；没有 diff 的
+文件不显示。点击普通文件只显示 Git diff，不会显示完整文件内容；已删除文件只显示
+删除状态。词级高亮由 Git `--word-diff=porcelain` 生成，并使用 UTF-8 locale 处理中文。
+Commit 只提交当前文件，并要求后端密码校验。
 
 ## Operations
 

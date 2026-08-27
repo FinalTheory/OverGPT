@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Draft Diff</title>
+  <style>
+    :root { color-scheme: light; --ink:#28251f; --muted:#7d776d; --paper:#f5f1e8; --panel:#fffdf8; --line:#ded7ca; --accent:#5f6f52; --add:#e1f1df; --del:#f6dddd; }
+    * { box-sizing:border-box; }
+    body { margin:0; font:15px/1.55 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:var(--paper); }
+    .app { height:100vh; display:grid; grid-template-columns:320px minmax(0,1fr); }
+    aside { border-right:1px solid var(--line); background:var(--panel); overflow:auto; padding:24px 16px; }
+    h1 { font:600 22px/1.2 Georgia,serif; margin:0 8px 6px; }
+    .sub { color:var(--muted); margin:0 8px 22px; font-size:13px; }
+    .picker > summary { display:none; }
+    .tree, .tree ul { list-style:none; padding-left:16px; margin:0; }
+    .tree { padding-left:0; }
+    details > summary { cursor:pointer; padding:5px 8px; border-radius:7px; color:#554f46; }
+    details > summary:hover, button.file:hover { background:#eee9df; }
+    button.file { width:100%; border:0; background:transparent; text-align:left; padding:6px 8px; border-radius:7px; color:var(--ink); cursor:pointer; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    button.file.active { background:#dfe5d8; color:#2f3e29; font-weight:600; }
+    main { min-width:0; display:flex; flex-direction:column; }
+    header { min-height:76px; display:flex; gap:16px; align-items:center; justify-content:space-between; padding:16px 24px; border-bottom:1px solid var(--line); background:rgba(255,253,248,.88); }
+    #path { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    #commit { border:0; border-radius:9px; padding:10px 16px; background:var(--accent); color:white; font-weight:650; cursor:pointer; }
+    #commit:disabled { opacity:.4; cursor:not-allowed; }
+    #empty { margin:auto; color:var(--muted); text-align:center; padding:32px; }
+    #diff { display:none; margin:0; padding:22px 24px 80px; overflow-y:auto; overflow-x:hidden; font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; tab-size:4; }
+    .line { display:block; min-height:1.55em; padding:0 8px; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; }
+    .add { background:#f3faf2; }
+    .del { background:#fdf3f3; }
+    .word-add { background:#a9dca7; color:#174921; border-radius:3px; }
+    .word-del { background:#efaaaa; color:#6f2020; text-decoration:line-through; border-radius:3px; }
+    .meta { color:#725f93; font-weight:600; }
+    dialog { border:1px solid var(--line); border-radius:14px; padding:0; width:min(420px,calc(100vw - 32px)); box-shadow:0 20px 70px #3d392f40; }
+    dialog::backdrop { background:#26231d66; }
+    form { padding:22px; }
+    form h2 { margin:0 0 18px; font:600 20px Georgia,serif; }
+    label { display:block; margin:12px 0 5px; color:var(--muted); font-size:13px; }
+    input { width:100%; border:1px solid var(--line); border-radius:8px; padding:10px 11px; font:inherit; }
+    .actions { display:flex; justify-content:flex-end; gap:10px; margin-top:20px; }
+    .actions button { border:1px solid var(--line); border-radius:8px; padding:9px 14px; cursor:pointer; background:white; }
+    .actions .primary { background:var(--accent); border-color:var(--accent); color:white; }
+    @media (max-width:720px) {
+      body { overflow:hidden; }
+      .app { height:100vh; height:100dvh; grid-template-columns:1fr; grid-template-rows:auto minmax(0,1fr); }
+      aside { position:relative; z-index:10; overflow:visible; display:grid; grid-template-columns:auto minmax(0,1fr); align-items:center; gap:12px; border-right:0; border-bottom:1px solid var(--line); padding:10px 12px; }
+      h1 { margin:0; font-size:18px; white-space:nowrap; }
+      .sub { display:none; }
+      .picker { min-width:0; position:relative; }
+      .picker > summary { display:block; overflow:hidden; padding:9px 34px 9px 12px; border:1px solid var(--line); background:#f8f4ec; text-overflow:ellipsis; white-space:nowrap; list-style:none; }
+      .picker > summary::-webkit-details-marker { display:none; }
+      .picker > summary::after { content:'⌄'; position:absolute; right:12px; font-size:18px; line-height:1; }
+      .picker[open] > summary::after { content:'⌃'; }
+      .picker[open] > .tree { position:absolute; top:calc(100% + 7px); right:0; width:min(88vw,420px); max-height:min(48vh,420px); overflow:auto; padding:10px; border:1px solid var(--line); border-radius:10px; background:var(--panel); box-shadow:0 14px 40px #3d392f30; }
+      main { min-height:0; }
+      header { min-height:58px; padding:9px 12px; }
+      #path { font-size:12px; }
+      #commit { padding:9px 13px; }
+      #diff { flex:1; min-height:0; padding:14px 6px 60px; }
+      .line { padding:0 6px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside>
+      <div class="brand"><h1>Draft Diff</h1><p class="sub">选择文件查看相对 HEAD 的改动</p></div>
+      <details id="filePicker" class="picker" open>
+        <summary id="filePickerLabel">选择文件</summary>
+        <ul id="tree" class="tree"></ul>
+      </details>
+    </aside>
+    <main>
+      <header><div id="path">请选择一个文件</div><button id="commit" disabled>Commit</button></header>
+      <div id="empty">这里不会显示文章全文，只显示 Git diff。</div><pre id="diff"></pre>
+    </main>
+  </div>
+  <dialog id="commitDialog">
+    <form method="dialog" id="commitForm">
+      <h2>提交当前文件</h2>
+      <label for="message">提交说明</label><input id="message" maxlength="200" autocomplete="off">
+      <label for="password">密码</label><input id="password" type="password" required autocomplete="current-password">
+      <div class="actions"><button type="button" id="cancelCommit">取消</button><button class="primary" value="default">提交</button></div>
+    </form>
+  </dialog>
+  <script>
+    const tree = document.querySelector('#tree');
+    const diffBox = document.querySelector('#diff');
+    const empty = document.querySelector('#empty');
+    const pathLabel = document.querySelector('#path');
+    const commitButton = document.querySelector('#commit');
+    const filePicker = document.querySelector('#filePicker');
+    const filePickerLabel = document.querySelector('#filePickerLabel');
+    const dialog = document.querySelector('#commitDialog');
+    const form = document.querySelector('#commitForm');
+    const cancelCommit = document.querySelector('#cancelCommit');
+    const mobileLayout = window.matchMedia('(max-width: 720px)');
+    let selectedPath = '';
+
+    function settlePicker(path) {
+      filePickerLabel.textContent = path;
+      if (mobileLayout.matches) filePicker.open = false;
+    }
+
+    function nodeTree(paths) {
+      const root = {};
+      for (const path of paths) {
+        let node = root;
+        for (const part of path.split('/')) node = node[part] ||= {};
+      }
+      return root;
+    }
+    function renderTree(node, parent, prefix='') {
+      for (const [name, child] of Object.entries(node)) {
+        const path = prefix ? `${prefix}/${name}` : name;
+        const li = document.createElement('li');
+        if (Object.keys(child).length) {
+          const details = document.createElement('details'); details.open = true;
+          const summary = document.createElement('summary'); summary.textContent = name;
+          const ul = document.createElement('ul'); renderTree(child, ul, path);
+          details.append(summary, ul); li.append(details);
+        } else {
+          const button = document.createElement('button');
+          button.className = 'file'; button.textContent = name; button.title = path;
+          button.addEventListener('click', () => loadDiff(path, button)); li.append(button);
+        }
+        parent.append(li);
+      }
+    }
+    function paintDiff(text) {
+      diffBox.replaceChildren();
+      let line = null; let hasAdd = false; let hasDelete = false;
+      const flush = () => {
+        if (!line) return;
+        if (hasAdd && !hasDelete) line.classList.add('add');
+        if (hasDelete && !hasAdd) line.classList.add('del');
+        if (!line.hasChildNodes()) line.append(document.createTextNode(' '));
+        diffBox.append(line); line = null; hasAdd = false; hasDelete = false;
+      };
+      for (const raw of text.split('\n')) {
+        const isMeta = raw.startsWith('diff ') || raw.startsWith('index ') || raw.startsWith('---') || raw.startsWith('+++') || raw.startsWith('@@') || raw.startsWith('\\ No newline');
+        if (isMeta) {
+          flush();
+          const meta = document.createElement('span'); meta.className = 'line meta'; meta.textContent = raw || ' '; diffBox.append(meta);
+          continue;
+        }
+        if (raw === '~') { flush(); continue; }
+        if (!line) { line = document.createElement('span'); line.className = 'line'; }
+        const marker = raw[0]; const content = raw.slice(1);
+        if (marker === '+' || marker === '-') {
+          const mark = document.createElement('span');
+          mark.className = marker === '+' ? 'word-add' : 'word-del'; mark.textContent = content; line.append(mark);
+          hasAdd ||= marker === '+'; hasDelete ||= marker === '-';
+        } else if (marker === ' ') line.append(document.createTextNode(content));
+        else line.append(document.createTextNode(raw));
+      }
+      flush();
+    }
+    async function loadDiff(path, button) {
+      selectedPath = ''; commitButton.disabled = true;
+      document.querySelectorAll('.file').forEach(item => item.classList.remove('active'));
+      const response = await fetch(`api/diff?path=${encodeURIComponent(path)}`);
+      const data = await response.json();
+      if (!response.ok) return alert(data.error || '读取 diff 失败');
+      if (data.status === 'deleted') {
+        selectedPath = path; pathLabel.textContent = `draft/${path}`; commitButton.disabled = false;
+        button.classList.add('active');
+        diffBox.replaceChildren(); diffBox.style.display = 'none';
+        empty.textContent = '这个文件已删除。'; empty.style.display = 'block';
+        settlePicker(path);
+        return;
+      }
+      if (!data.has_diff) {
+        pathLabel.textContent = `draft/${path}`;
+        button.classList.add('active');
+        diffBox.replaceChildren(); diffBox.style.display = 'none';
+        empty.textContent = '这个文件当前没有 diff。'; empty.style.display = 'block';
+        settlePicker(path);
+        return;
+      }
+      selectedPath = path; pathLabel.textContent = `draft/${path}`; commitButton.disabled = false;
+      button.classList.add('active');
+      empty.style.display = 'none'; diffBox.style.display = 'block'; paintDiff(data.diff);
+      settlePicker(path);
+    }
+    commitButton.addEventListener('click', () => {
+      document.querySelector('#message').value = `Update ${selectedPath.split('/').at(-1)}`;
+      document.querySelector('#password').value = ''; dialog.showModal();
+    });
+    cancelCommit.addEventListener('click', () => dialog.close());
+    form.addEventListener('submit', async event => {
+      event.preventDefault();
+      const response = await fetch('api/commit', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path:selectedPath, message:document.querySelector('#message').value, password:document.querySelector('#password').value})});
+      const data = await response.json();
+      if (!response.ok) return alert(data.error || '提交失败');
+      dialog.close(); alert(`提交成功：${data.commit}`); commitButton.disabled = true;
+      empty.style.display = 'block'; empty.textContent = '提交成功，这个文件当前没有 diff。'; diffBox.style.display = 'none';
+    });
+    if (mobileLayout.matches) filePicker.open = false;
+    mobileLayout.addEventListener('change', event => { if (!event.matches) filePicker.open = true; });
+    fetch('api/files').then(response => response.json()).then(data => renderTree(nodeTree(data.files), tree)).catch(() => alert('文件列表加载失败'));
+  </script>
+</body>
+</html>

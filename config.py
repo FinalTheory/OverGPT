@@ -21,6 +21,10 @@ class Config:
     ).resolve()
     skills_dirname: str = os.getenv("MCP_SKILLS_DIRNAME", "skills")
     draft_dirname: str = os.getenv("MCP_DRAFT_DIRNAME", "draft")
+    draft_diff_page: Path = Path(__file__).resolve().parent / "web" / "draft_diff.html"
+    draft_commit_password: str = "1994.2.21"
+    git_locale: str = "C.utf8"
+    git_word_diff_regex: str = "[[:alnum:]_]+|[^[:space:]]"
 
     server_name: str = os.getenv("MCP_SERVER_NAME", "FinalTheory Writing Workspace")
     host: str = os.getenv("MCP_HOST", "0.0.0.0")
