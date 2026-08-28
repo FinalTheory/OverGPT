@@ -19,13 +19,19 @@
     details > summary:hover, button.file:hover { background:#eee9df; }
     button.file { width:100%; border:0; background:transparent; text-align:left; padding:6px 8px; border-radius:7px; color:var(--ink); cursor:pointer; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     button.file.active { background:#dfe5d8; color:#2f3e29; font-weight:600; }
-    main { min-width:0; display:flex; flex-direction:column; }
-    header { min-height:76px; display:flex; gap:16px; align-items:center; justify-content:space-between; padding:16px 24px; border-bottom:1px solid var(--line); background:rgba(255,253,248,.88); }
+    main { min-width:0; min-height:0; overflow:hidden; display:flex; flex-direction:column; }
+    header { position:sticky; top:0; z-index:5; flex:none; min-height:76px; display:flex; gap:16px; align-items:center; justify-content:space-between; padding:16px 24px; border-bottom:1px solid var(--line); background:rgba(255,253,248,.96); }
     #path { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    #commit { border:0; border-radius:9px; padding:10px 16px; background:var(--accent); color:white; font-weight:650; cursor:pointer; }
+    .header-actions { display:flex; align-items:center; gap:8px; flex:none; }
+    #refresh, #commit { border:0; border-radius:9px; padding:10px 16px; font-weight:650; cursor:pointer; }
+    #refresh { border:1px solid var(--line); background:#f8f4ec; color:var(--ink); }
+    #refresh:disabled { opacity:.55; cursor:wait; }
+    #refresh.refreshing { animation:pulse .7s ease-in-out infinite alternate; }
+    #commit { background:var(--accent); color:white; }
     #commit:disabled { opacity:.4; cursor:not-allowed; }
+    @keyframes pulse { to { opacity:.55; } }
     #empty { margin:auto; color:var(--muted); text-align:center; padding:32px; }
-    #diff { display:none; margin:0; padding:22px 24px 80px; overflow-y:auto; overflow-x:hidden; font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; tab-size:4; }
+    #diff { display:none; flex:1; min-height:0; margin:0; padding:22px 24px 80px; overflow-y:auto; overflow-x:hidden; font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; tab-size:4; }
     .line { display:block; min-height:1.55em; padding:0 8px; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; }
     .add { background:#f3faf2; }
     .del { background:#fdf3f3; }
@@ -56,7 +62,7 @@
       main { min-height:0; }
       header { min-height:58px; padding:9px 12px; }
       #path { font-size:12px; }
-      #commit { padding:9px 13px; }
+      #refresh, #commit { padding:9px 12px; }
       #diff { flex:1; min-height:0; padding:14px 6px 60px; }
       .line { padding:0 6px; }
     }
@@ -72,7 +78,10 @@
       </details>
     </aside>
     <main>
-      <header><div id="path">请选择一个文件</div><button id="commit" disabled>Commit</button></header>
+      <header>
+        <div id="path">请选择一个文件</div>
+        <div class="header-actions"><button id="refresh" type="button">刷新</button><button id="commit" disabled>Commit</button></div>
+      </header>
       <div id="empty">这里不会显示文章全文，只显示 Git diff。</div><pre id="diff"></pre>
     </main>
   </div>
@@ -89,6 +98,7 @@
     const diffBox = document.querySelector('#diff');
     const empty = document.querySelector('#empty');
     const pathLabel = document.querySelector('#path');
+    const refreshButton = document.querySelector('#refresh');
     const commitButton = document.querySelector('#commit');
     const filePicker = document.querySelector('#filePicker');
     const filePickerLabel = document.querySelector('#filePickerLabel');
@@ -122,7 +132,7 @@
           details.append(summary, ul); li.append(details);
         } else {
           const button = document.createElement('button');
-          button.className = 'file'; button.textContent = name; button.title = path;
+          button.className = 'file'; button.textContent = name; button.title = path; button.dataset.path = path;
           button.addEventListener('click', () => loadDiff(path, button)); li.append(button);
         }
         parent.append(li);
@@ -184,6 +194,39 @@
       empty.style.display = 'none'; diffBox.style.display = 'block'; paintDiff(data.diff);
       settlePicker(path);
     }
+    async function loadFileTree() {
+      const response = await fetch('api/files');
+      if (!response.ok) throw new Error('文件列表加载失败');
+      const data = await response.json();
+      tree.replaceChildren(); renderTree(nodeTree(data.files), tree);
+      return data.files;
+    }
+    async function refreshView() {
+      const currentPath = selectedPath;
+      const diffScrollTop = diffBox.scrollTop;
+      const sidebar = document.querySelector('aside');
+      const sidebarScrollTop = sidebar.scrollTop;
+      refreshButton.disabled = true; refreshButton.classList.add('refreshing');
+      try {
+        const files = await loadFileTree();
+        if (currentPath && files.includes(currentPath)) {
+          const button = [...document.querySelectorAll('.file')].find(item => item.dataset.path === currentPath);
+          await loadDiff(currentPath, button);
+          requestAnimationFrame(() => { diffBox.scrollTop = diffScrollTop; sidebar.scrollTop = sidebarScrollTop; });
+        } else if (currentPath) {
+          selectedPath = ''; commitButton.disabled = true;
+          pathLabel.textContent = `draft/${currentPath}`;
+          diffBox.replaceChildren(); diffBox.style.display = 'none';
+          empty.textContent = '这个文件当前已经没有 diff。'; empty.style.display = 'block';
+          requestAnimationFrame(() => { sidebar.scrollTop = sidebarScrollTop; });
+        } else requestAnimationFrame(() => { sidebar.scrollTop = sidebarScrollTop; });
+      } catch (error) {
+        alert(error.message || '刷新失败');
+      } finally {
+        refreshButton.disabled = false; refreshButton.classList.remove('refreshing');
+      }
+    }
+    refreshButton.addEventListener('click', refreshView);
     commitButton.addEventListener('click', () => {
       document.querySelector('#message').value = `Update ${selectedPath.split('/').at(-1)}`;
       document.querySelector('#password').value = ''; dialog.showModal();
@@ -194,12 +237,11 @@
       const response = await fetch('api/commit', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path:selectedPath, message:document.querySelector('#message').value, password:document.querySelector('#password').value})});
       const data = await response.json();
       if (!response.ok) return alert(data.error || '提交失败');
-      dialog.close(); alert(`提交成功：${data.commit}`); commitButton.disabled = true;
-      empty.style.display = 'block'; empty.textContent = '提交成功，这个文件当前没有 diff。'; diffBox.style.display = 'none';
+      dialog.close(); alert(`提交成功：${data.commit}`); await refreshView();
     });
     if (mobileLayout.matches) filePicker.open = false;
     mobileLayout.addEventListener('change', event => { if (!event.matches) filePicker.open = true; });
-    fetch('api/files').then(response => response.json()).then(data => renderTree(nodeTree(data.files), tree)).catch(() => alert('文件列表加载失败'));
+    loadFileTree().catch(error => alert(error.message || '文件列表加载失败'));
   </script>
 </body>
 </html>
