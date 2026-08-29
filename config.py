@@ -25,6 +25,7 @@ class Config:
     draft_commit_password: str = "1994.2.21"
     git_locale: str = "C.utf8"
     git_word_diff_regex: str = "[[:alnum:]_]+|[^[:space:]]"
+    draft_history_limit: int = int(os.getenv("MCP_DRAFT_HISTORY_LIMIT", "20"))
 
     server_name: str = os.getenv("MCP_SERVER_NAME", "FinalTheory Writing Workspace")
     host: str = os.getenv("MCP_HOST", "0.0.0.0")
@@ -35,6 +36,7 @@ class Config:
     max_timeout_seconds: int = int(os.getenv("MCP_MAX_TIMEOUT", "120"))
     max_output_chars: int = int(os.getenv("MCP_MAX_OUTPUT_CHARS", "50000"))
     max_read_chars: int = int(os.getenv("MCP_MAX_READ_CHARS", "200000"))
+    max_patch_chars: int = int(os.getenv("MCP_MAX_PATCH_CHARS", "2000000"))
     restart_delay_seconds: float = float(os.getenv("MCP_RESTART_DELAY", "2"))
 
     @property

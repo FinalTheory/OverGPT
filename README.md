@@ -11,7 +11,11 @@
 - `list_draft_articles`：列出 `draft` 内 Markdown 的 workspace 相对路径和第一行标题
 - `load_skill`：加载完整的 `SKILL.md`
 - `read_workspace_file`：读取共享目录内的文本文件
+- `read_workspace_range`：按行号范围或唯一锚点读取局部上下文
 - `write_workspace_file`：原子写入共享目录内的文本文件
+- `replace_workspace_text`：校验匹配次数后进行原子精确替换
+- `insert_workspace_text`：校验锚点匹配次数后在其前后原子插入
+- `apply_workspace_patch`：在全部 context 匹配时原子应用 unified diff
 - `restart_mcp_server`：校验修改后的 Python 代码，然后退出并由 Docker 自动拉起
 - `run_workspace_code`：在容器中运行 Python 或 Shell
 
@@ -23,7 +27,8 @@
 访问 `/diff/` 可按 `draft` 的目录结构浏览相对 `HEAD` 有改动的文件；没有 diff 的
 文件不显示。点击普通文件只显示 Git diff，不会显示完整文件内容；已删除文件只显示
 删除状态。词级高亮由 Git `--word-diff=porcelain` 生成，并使用 UTF-8 locale 处理中文。
-Commit 只提交当前文件，并要求后端密码校验。
+选择文件后可以把比较基准从 `HEAD` 切换到该文件的任意历史 commit。Commit 只提交
+当前文件，并要求后端密码校验；查看历史基准时不允许提交。
 
 ## Operations
 

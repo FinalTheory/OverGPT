@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hmac
 import os
+import re
 import subprocess
 import tempfile
 import threading
@@ -25,7 +26,9 @@ mcp = FastMCP(
         "reusable writing workflows; draft/<year-month>/<article>.md contains article drafts and is a Git "
         "repository; mymcp/ contains this MCP server's code; scripts/ contains other content management scripts. Before a writing task, call "
         "list_skills and load the relevant skills. Use list_draft_articles to discover existing "
-        "drafts before reading or editing them."
+        "drafts before reading or editing them. Prefer read_workspace_range plus "
+        "replace_workspace_text or insert_workspace_text for precise edits; their match-count "
+        "guards prevent accidental broad changes."
     ),
     host=CONFIG.host,
     port=CONFIG.port,
@@ -33,6 +36,8 @@ mcp = FastMCP(
     stateless_http=True,
     json_response=True,
 )
+
+_workspace_write_lock = threading.RLock()
 
 
 def _workspace_path(relative_path: str, *, must_exist: bool = False) -> Path:
@@ -85,18 +90,35 @@ def _truncate(value: str) -> tuple[str, bool]:
 
 
 def _write_text_atomic(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(content)
-        os.replace(temp_name, path)
-    except BaseException:
+    with _workspace_write_lock:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
         try:
-            os.unlink(temp_name)
-        except FileNotFoundError:
-            pass
-        raise
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if path.exists():
+                os.chmod(temp_name, path.stat().st_mode & 0o7777)
+            os.replace(temp_name, path)
+        except BaseException:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
+            raise
+
+
+def _read_workspace_text(path: str) -> tuple[Path, str]:
+    resolved = _workspace_path(path, must_exist=True)
+    if not resolved.is_file():
+        raise ValueError("path is not a file")
+    return resolved, resolved.read_text(encoding="utf-8")
+
+
+def _validate_expected_count(expected_count: int) -> None:
+    if expected_count < 1:
+        raise ValueError("expected_count must be at least 1")
 
 
 def _run_checked(command: list[str], cwd: Path) -> str:
@@ -113,6 +135,29 @@ def _run_checked(command: list[str], cwd: Path) -> str:
         raise RuntimeError(f"required executable is unavailable: {command[0]}") from error
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or f"command failed: {' '.join(command)}")
+    return result.stdout
+
+
+def _git_apply(patch: str, *, check: bool) -> str:
+    command = ["git", "apply"]
+    if check:
+        command.append("--check")
+    command.extend(["--whitespace=nowarn", "-"])
+    try:
+        result = subprocess.run(
+            command,
+            cwd=CONFIG.workspace_root,
+            input=patch,
+            text=True,
+            capture_output=True,
+            timeout=CONFIG.max_timeout_seconds,
+            check=False,
+        )
+    except FileNotFoundError as error:
+        raise RuntimeError("required executable is unavailable: git") from error
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "git apply failed"
+        raise ValueError(detail)
     return result.stdout
 
 
@@ -144,8 +189,46 @@ def _draft_files() -> list[str]:
     return sorted(files, key=lambda value: (value.casefold(), value))
 
 
-def _git_diff_for_file(relative_path: str) -> str:
+def _validated_revision(revision: str) -> str:
+    if revision == "HEAD":
+        return revision
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", revision):
+        raise ValueError("revision must be HEAD or a full commit hash")
+    return _run_checked(
+        ["git", "rev-parse", "--verify", f"{revision}^{{commit}}"], CONFIG.draft_root
+    ).strip()
+
+
+def _git_commits_for_file(relative_path: str) -> list[dict[str, str]]:
+    _, normalized = _draft_file(relative_path, must_exist=False)
+    head = _run_checked(["git", "rev-parse", "HEAD"], CONFIG.draft_root).strip()
+    output = _run_checked(
+        [
+            "git",
+            "log",
+            "--follow",
+            f"--max-count={CONFIG.draft_history_limit + 1}",
+            "--format=%H%x1f%h%x1f%cs%x1f%s%x1e",
+            "--",
+            normalized,
+        ],
+        CONFIG.draft_root,
+    )
+    commits: list[dict[str, str]] = []
+    for record in output.split("\x1e"):
+        fields = record.strip().split("\x1f", 3)
+        if len(fields) == 4 and fields[0] != head:
+            commits.append(
+                {"hash": fields[0], "short_hash": fields[1], "date": fields[2], "subject": fields[3]}
+            )
+            if len(commits) >= CONFIG.draft_history_limit:
+                break
+    return commits
+
+
+def _git_diff_for_file(relative_path: str, revision: str = "HEAD") -> str:
     resolved, normalized = _draft_file(relative_path, must_exist=False)
+    revision = _validated_revision(revision)
     tracked = subprocess.run(
         ["git", "ls-files", "--error-unmatch", "--", normalized],
         cwd=CONFIG.draft_root,
@@ -161,7 +244,7 @@ def _git_diff_for_file(relative_path: str) -> str:
         f"--word-diff-regex={CONFIG.git_word_diff_regex}",
     ]
     command = (
-        ["git", "diff", "--no-ext-diff", "--no-color", *word_diff_args, "HEAD", "--", normalized]
+        ["git", "diff", "--no-ext-diff", "--no-color", *word_diff_args, revision, "--", normalized]
         if tracked
         else [
             "git",
@@ -230,10 +313,7 @@ def load_skill(name: str) -> str:
 @mcp.tool()
 def read_workspace_file(path: str) -> dict[str, Any]:
     """Read a UTF-8 text file using a path relative to the shared workspace."""
-    resolved = _workspace_path(path, must_exist=True)
-    if not resolved.is_file():
-        raise ValueError("path is not a file")
-    content = resolved.read_text(encoding="utf-8")
+    resolved, content = _read_workspace_text(path)
     truncated = len(content) > CONFIG.max_read_chars
     return {
         "path": path,
@@ -244,16 +324,169 @@ def read_workspace_file(path: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+def read_workspace_range(
+    path: str,
+    start_line: int | None = None,
+    end_line: int | None = None,
+    anchor: str | None = None,
+    context_lines: int = 20,
+) -> dict[str, Any]:
+    """Read an inclusive line range or context surrounding one exact anchor.
+
+    Paths are relative to the workspace. For line mode, provide both start_line
+    and end_line using 1-based inclusive line numbers. For anchor mode, provide
+    only anchor; it must occur exactly once, and context_lines lines are returned
+    before and after it. The returned start_line/end_line identify the excerpt.
+    """
+    _, content = _read_workspace_text(path)
+    lines = content.splitlines(keepends=True)
+    total_lines = len(lines)
+
+    if anchor is not None:
+        if start_line is not None or end_line is not None:
+            raise ValueError("provide either anchor or a line range, not both")
+        if not anchor:
+            raise ValueError("anchor must not be empty")
+        if context_lines < 0:
+            raise ValueError("context_lines must be non-negative")
+        actual_count = content.count(anchor)
+        if actual_count != 1:
+            raise ValueError(f"anchor matched {actual_count} times; expected exactly 1")
+        match_start = content.find(anchor)
+        match_end = match_start + len(anchor)
+        anchor_start_line = content.count("\n", 0, match_start) + 1
+        anchor_end_line = content.count("\n", 0, max(match_start, match_end - 1)) + 1
+        selected_start = max(1, anchor_start_line - context_lines)
+        selected_end = min(total_lines, anchor_end_line + context_lines)
+        mode = "anchor"
+    else:
+        if start_line is None or end_line is None:
+            raise ValueError("provide anchor or both start_line and end_line")
+        if start_line < 1 or end_line < start_line:
+            raise ValueError("line range must be 1-based with end_line >= start_line")
+        if end_line > total_lines:
+            raise ValueError(f"end_line exceeds file length of {total_lines} lines")
+        selected_start = start_line
+        selected_end = end_line
+        mode = "lines"
+
+    excerpt = "".join(lines[selected_start - 1 : selected_end])
+    truncated = len(excerpt) > CONFIG.max_read_chars
+    return {
+        "path": path,
+        "mode": mode,
+        "start_line": selected_start,
+        "end_line": selected_end,
+        "total_lines": total_lines,
+        "content": excerpt[: CONFIG.max_read_chars],
+        "truncated": truncated,
+    }
+
+
+@mcp.tool()
 def write_workspace_file(path: str, content: str, overwrite: bool = False) -> dict[str, Any]:
     """Write a UTF-8 document atomically inside the shared workspace.
 
     Set overwrite=true only when replacing an existing file is intentional.
     """
-    resolved = _workspace_path(path)
-    if resolved.exists() and not overwrite:
-        raise FileExistsError("file already exists; set overwrite=true to replace it")
-    _write_text_atomic(resolved, content)
+    with _workspace_write_lock:
+        resolved = _workspace_path(path)
+        if resolved.exists() and not overwrite:
+            raise FileExistsError("file already exists; set overwrite=true to replace it")
+        _write_text_atomic(resolved, content)
     return {"path": path, "size_bytes": resolved.stat().st_size, "created": True}
+
+
+@mcp.tool()
+def replace_workspace_text(
+    path: str,
+    old_text: str,
+    new_text: str,
+    expected_count: int = 1,
+) -> dict[str, Any]:
+    """Atomically replace exact text only when its match count is as expected.
+
+    The complete file is validated before any write. If old_text occurs a
+    different number of times, the operation fails and leaves the file untouched.
+    Paths are relative to the shared workspace.
+    """
+    if not old_text:
+        raise ValueError("old_text must not be empty")
+    _validate_expected_count(expected_count)
+    with _workspace_write_lock:
+        resolved, content = _read_workspace_text(path)
+        actual_count = content.count(old_text)
+        if actual_count != expected_count:
+            raise ValueError(
+                f"old_text matched {actual_count} times; expected {expected_count}; file unchanged"
+            )
+        updated = content.replace(old_text, new_text)
+        _write_text_atomic(resolved, updated)
+    return {
+        "path": path,
+        "replacements": actual_count,
+        "size_bytes": resolved.stat().st_size,
+    }
+
+
+@mcp.tool()
+def insert_workspace_text(
+    path: str,
+    anchor: str,
+    text: str,
+    position: Literal["before", "after"],
+    expected_count: int = 1,
+) -> dict[str, Any]:
+    """Atomically insert text before or after an exact anchor.
+
+    The complete file is validated before any write. If anchor occurs a
+    different number of times, the operation fails and leaves the file untouched.
+    When expected_count is greater than one, insertion occurs at every match.
+    """
+    if not anchor:
+        raise ValueError("anchor must not be empty")
+    _validate_expected_count(expected_count)
+    with _workspace_write_lock:
+        resolved, content = _read_workspace_text(path)
+        actual_count = content.count(anchor)
+        if actual_count != expected_count:
+            raise ValueError(
+                f"anchor matched {actual_count} times; expected {expected_count}; file unchanged"
+            )
+        replacement = f"{text}{anchor}" if position == "before" else f"{anchor}{text}"
+        updated = content.replace(anchor, replacement)
+        _write_text_atomic(resolved, updated)
+    return {
+        "path": path,
+        "insertions": actual_count,
+        "position": position,
+        "size_bytes": resolved.stat().st_size,
+    }
+
+
+@mcp.tool()
+def apply_workspace_patch(patch: str) -> dict[str, Any]:
+    """Apply one unified diff atomically relative to the shared workspace.
+
+    Use standard Git-style paths such as a/draft/article.md and
+    b/draft/article.md. The complete patch is checked before application. If
+    any file path, hunk, or context does not match, the operation fails without
+    applying any part of the patch. Three-way merging and partial rejects are
+    intentionally disabled.
+    """
+    if not patch.strip():
+        raise ValueError("patch must not be empty")
+    if "\0" in patch:
+        raise ValueError("patch must not contain NUL bytes")
+    if len(patch) > CONFIG.max_patch_chars:
+        raise ValueError(f"patch exceeds the {CONFIG.max_patch_chars} character limit")
+    if not CONFIG.workspace_root.is_dir():
+        raise FileNotFoundError("workspace root does not exist")
+
+    with _workspace_write_lock:
+        _git_apply(patch, check=True)
+        _git_apply(patch, check=False)
+    return {"applied": True, "patch_chars": len(patch)}
 
 
 @mcp.tool()
@@ -348,10 +581,21 @@ async def draft_diff_files(request: Request) -> Response:
     return JSONResponse({"files": _draft_files()})
 
 
+@mcp.custom_route("/diff/api/commits", methods=["GET"], include_in_schema=False)
+async def draft_diff_commits(request: Request) -> Response:
+    try:
+        relative_path = request.query_params.get("path", "")
+        return JSONResponse({"path": relative_path, "commits": _git_commits_for_file(relative_path)})
+    except (ValueError, RuntimeError) as error:
+        return JSONResponse({"error": str(error)}, status_code=400)
+
+
 @mcp.custom_route("/diff/api/diff", methods=["GET"], include_in_schema=False)
 async def draft_diff_content(request: Request) -> Response:
     try:
         relative_path = request.query_params.get("path", "")
+        revision = request.query_params.get("revision", "HEAD")
+        revision = _validated_revision(revision)
         resolved, normalized = _draft_file(relative_path, must_exist=False)
         if not resolved.exists():
             tracked = subprocess.run(
@@ -364,11 +608,23 @@ async def draft_diff_content(request: Request) -> Response:
             ).returncode == 0
             if tracked:
                 return JSONResponse(
-                    {"path": relative_path, "diff": "", "has_diff": True, "status": "deleted"}
+                    {
+                        "path": relative_path,
+                        "revision": revision,
+                        "diff": "",
+                        "has_diff": True,
+                        "status": "deleted",
+                    }
                 )
-        diff = _git_diff_for_file(relative_path)
+        diff = _git_diff_for_file(relative_path, revision)
         return JSONResponse(
-            {"path": relative_path, "diff": diff, "has_diff": bool(diff), "status": "changed"}
+            {
+                "path": relative_path,
+                "revision": revision,
+                "diff": diff,
+                "has_diff": bool(diff),
+                "status": "changed",
+            }
         )
     except (ValueError, RuntimeError) as error:
         return JSONResponse({"error": str(error)}, status_code=400)

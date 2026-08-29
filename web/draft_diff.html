@@ -7,12 +7,19 @@
   <style>
     :root { color-scheme: light; --ink:#28251f; --muted:#7d776d; --paper:#f5f1e8; --panel:#fffdf8; --line:#ded7ca; --accent:#5f6f52; --add:#e1f1df; --del:#f6dddd; }
     * { box-sizing:border-box; }
+    [hidden] { display:none !important; }
     body { margin:0; font:15px/1.55 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:var(--paper); }
     .app { height:100vh; display:grid; grid-template-columns:320px minmax(0,1fr); }
     aside { border-right:1px solid var(--line); background:var(--panel); overflow:auto; padding:24px 16px; }
     h1 { font:600 22px/1.2 Georgia,serif; margin:0 8px 6px; }
     .sub { color:var(--muted); margin:0 8px 22px; font-size:13px; }
     .picker > summary { display:none; }
+    .selector-panel { min-width:0; }
+    .revision-panel { padding:0 8px; }
+    .back-button { border:0; background:transparent; color:var(--accent); padding:6px 0; font:600 14px/1.3 inherit; cursor:pointer; }
+    .revision-file { overflow:hidden; margin:8px 0 14px; color:var(--muted); font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace; text-overflow:ellipsis; white-space:nowrap; }
+    .revision-label { display:block; margin:0 0 6px; color:var(--muted); font-size:12px; }
+    #revisionSelect { width:100%; min-width:0; border:1px solid var(--line); border-radius:8px; background:#f8f4ec; color:var(--ink); padding:10px; font:13px/1.35 inherit; }
     .tree, .tree ul { list-style:none; padding-left:16px; margin:0; }
     .tree { padding-left:0; }
     details > summary { cursor:pointer; padding:5px 8px; border-radius:7px; color:#554f46; }
@@ -54,6 +61,11 @@
       h1 { margin:0; font-size:18px; white-space:nowrap; }
       .sub { display:none; }
       .picker { min-width:0; position:relative; }
+      .file-panel { min-width:0; }
+      .revision-panel { display:grid; grid-template-columns:auto minmax(0,1fr); align-items:center; gap:8px; padding:0; }
+      .revision-file, .revision-label { display:none; }
+      .back-button { padding:9px 8px; white-space:nowrap; }
+      #revisionSelect { padding:9px 30px 9px 9px; }
       .picker > summary { display:block; overflow:hidden; padding:9px 34px 9px 12px; border:1px solid var(--line); background:#f8f4ec; text-overflow:ellipsis; white-space:nowrap; list-style:none; }
       .picker > summary::-webkit-details-marker { display:none; }
       .picker > summary::after { content:'⌄'; position:absolute; right:12px; font-size:18px; line-height:1; }
@@ -72,10 +84,18 @@
   <div class="app">
     <aside>
       <div class="brand"><h1>Draft Diff</h1><p class="sub">选择文件查看相对 HEAD 的改动</p></div>
-      <details id="filePicker" class="picker" open>
-        <summary id="filePickerLabel">选择文件</summary>
-        <ul id="tree" class="tree"></ul>
-      </details>
+      <div id="filePanel" class="selector-panel file-panel">
+        <details id="filePicker" class="picker" open>
+          <summary id="filePickerLabel">选择文件</summary>
+          <ul id="tree" class="tree"></ul>
+        </details>
+      </div>
+      <div id="revisionPanel" class="selector-panel revision-panel" hidden>
+        <button id="backToFiles" class="back-button" type="button">← 返回文件</button>
+        <div class="revision-file" id="revisionFile"></div>
+        <label class="revision-label" for="revisionSelect">比较基准</label>
+        <select id="revisionSelect"></select>
+      </div>
     </aside>
     <main>
       <header>
@@ -100,17 +120,40 @@
     const pathLabel = document.querySelector('#path');
     const refreshButton = document.querySelector('#refresh');
     const commitButton = document.querySelector('#commit');
+    const filePanel = document.querySelector('#filePanel');
+    const revisionPanel = document.querySelector('#revisionPanel');
     const filePicker = document.querySelector('#filePicker');
     const filePickerLabel = document.querySelector('#filePickerLabel');
+    const backToFiles = document.querySelector('#backToFiles');
+    const revisionFile = document.querySelector('#revisionFile');
+    const revisionSelect = document.querySelector('#revisionSelect');
     const dialog = document.querySelector('#commitDialog');
     const form = document.querySelector('#commitForm');
     const cancelCommit = document.querySelector('#cancelCommit');
     const mobileLayout = window.matchMedia('(max-width: 720px)');
     let selectedPath = '';
+    let selectedRevision = 'HEAD';
 
-    function settlePicker(path) {
+    function showFilePanel(openList=false) {
+      revisionPanel.hidden = true; filePanel.hidden = false;
+      if (mobileLayout.matches) filePicker.open = openList;
+    }
+    async function showRevisionPanel(path, revision='HEAD') {
+      const response = await fetch(`api/commits?path=${encodeURIComponent(path)}`);
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || '提交历史加载失败');
+      revisionSelect.replaceChildren();
+      const current = document.createElement('option');
+      current.value = 'HEAD'; current.textContent = '当前版本 vs HEAD'; revisionSelect.append(current);
+      data.commits.forEach(commit => {
+        const option = document.createElement('option'); option.value = commit.hash;
+        option.textContent = `${commit.short_hash} · ${commit.date} · ${commit.subject}`;
+        revisionSelect.append(option);
+      });
+      revisionSelect.value = revision;
+      revisionFile.textContent = `draft/${path}`;
       filePickerLabel.textContent = path;
-      if (mobileLayout.matches) filePicker.open = false;
+      filePanel.hidden = true; revisionPanel.hidden = false;
     }
 
     function nodeTree(paths) {
@@ -133,7 +176,7 @@
         } else {
           const button = document.createElement('button');
           button.className = 'file'; button.textContent = name; button.title = path; button.dataset.path = path;
-          button.addEventListener('click', () => loadDiff(path, button)); li.append(button);
+          button.addEventListener('click', () => selectFile(path, button)); li.append(button);
         }
         parent.append(li);
       }
@@ -167,32 +210,36 @@
       }
       flush();
     }
-    async function loadDiff(path, button) {
-      selectedPath = ''; commitButton.disabled = true;
+    async function loadDiff(path, button, revision='HEAD') {
+      commitButton.disabled = true;
       document.querySelectorAll('.file').forEach(item => item.classList.remove('active'));
-      const response = await fetch(`api/diff?path=${encodeURIComponent(path)}`);
+      const response = await fetch(`api/diff?path=${encodeURIComponent(path)}&revision=${encodeURIComponent(revision)}`);
       const data = await response.json();
       if (!response.ok) return alert(data.error || '读取 diff 失败');
+      selectedPath = path; selectedRevision = revision;
+      const revisionLabel = revision === 'HEAD' ? 'HEAD' : revision.slice(0, 8);
+      pathLabel.textContent = `draft/${path} · vs ${revisionLabel}`;
+      button?.classList.add('active');
       if (data.status === 'deleted') {
-        selectedPath = path; pathLabel.textContent = `draft/${path}`; commitButton.disabled = false;
-        button.classList.add('active');
+        commitButton.disabled = revision !== 'HEAD';
         diffBox.replaceChildren(); diffBox.style.display = 'none';
         empty.textContent = '这个文件已删除。'; empty.style.display = 'block';
-        settlePicker(path);
         return;
       }
       if (!data.has_diff) {
-        pathLabel.textContent = `draft/${path}`;
-        button.classList.add('active');
         diffBox.replaceChildren(); diffBox.style.display = 'none';
-        empty.textContent = '这个文件当前没有 diff。'; empty.style.display = 'block';
-        settlePicker(path);
+        empty.textContent = `当前版本相对于 ${revisionLabel} 没有 diff。`; empty.style.display = 'block';
         return;
       }
-      selectedPath = path; pathLabel.textContent = `draft/${path}`; commitButton.disabled = false;
-      button.classList.add('active');
+      commitButton.disabled = revision !== 'HEAD';
       empty.style.display = 'none'; diffBox.style.display = 'block'; paintDiff(data.diff);
-      settlePicker(path);
+    }
+    async function selectFile(path, button) {
+      await loadDiff(path, button, 'HEAD');
+      if (selectedPath === path) {
+        try { await showRevisionPanel(path, 'HEAD'); }
+        catch (error) { alert(error.message || '提交历史加载失败'); }
+      }
     }
     async function loadFileTree() {
       const response = await fetch('api/files');
@@ -203,6 +250,7 @@
     }
     async function refreshView() {
       const currentPath = selectedPath;
+      const currentRevision = selectedRevision;
       const diffScrollTop = diffBox.scrollTop;
       const sidebar = document.querySelector('aside');
       const sidebarScrollTop = sidebar.scrollTop;
@@ -211,13 +259,15 @@
         const files = await loadFileTree();
         if (currentPath && files.includes(currentPath)) {
           const button = [...document.querySelectorAll('.file')].find(item => item.dataset.path === currentPath);
-          await loadDiff(currentPath, button);
+          await loadDiff(currentPath, button, currentRevision);
+          await showRevisionPanel(currentPath, currentRevision);
           requestAnimationFrame(() => { diffBox.scrollTop = diffScrollTop; sidebar.scrollTop = sidebarScrollTop; });
         } else if (currentPath) {
-          selectedPath = ''; commitButton.disabled = true;
+          selectedPath = ''; selectedRevision = 'HEAD'; commitButton.disabled = true;
           pathLabel.textContent = `draft/${currentPath}`;
           diffBox.replaceChildren(); diffBox.style.display = 'none';
           empty.textContent = '这个文件当前已经没有 diff。'; empty.style.display = 'block';
+          showFilePanel();
           requestAnimationFrame(() => { sidebar.scrollTop = sidebarScrollTop; });
         } else requestAnimationFrame(() => { sidebar.scrollTop = sidebarScrollTop; });
       } catch (error) {
@@ -227,6 +277,12 @@
       }
     }
     refreshButton.addEventListener('click', refreshView);
+    backToFiles.addEventListener('click', () => showFilePanel(true));
+    revisionSelect.addEventListener('change', async () => {
+      if (!selectedPath) return;
+      const button = [...document.querySelectorAll('.file')].find(item => item.dataset.path === selectedPath);
+      await loadDiff(selectedPath, button, revisionSelect.value);
+    });
     commitButton.addEventListener('click', () => {
       document.querySelector('#message').value = `Update ${selectedPath.split('/').at(-1)}`;
       document.querySelector('#password').value = ''; dialog.showModal();
