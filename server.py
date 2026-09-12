@@ -659,6 +659,52 @@ async def draft_diff_commit(request: Request) -> Response:
         return JSONResponse({"error": str(error)}, status_code=400)
 
 
+@mcp.custom_route("/diff/api/revert", methods=["POST"], include_in_schema=False)
+async def draft_diff_revert(request: Request) -> Response:
+    try:
+        payload = await request.json()
+        password = str(payload.get("password", ""))
+        if not hmac.compare_digest(password, CONFIG.draft_commit_password):
+            return JSONResponse({"error": "密码错误"}, status_code=401)
+
+        resolved, relative_path = _draft_file(str(payload.get("path", "")), must_exist=False)
+        with _workspace_write_lock:
+            if not _git_diff_for_file(relative_path):
+                return JSONResponse({"error": "这个文件没有可撤销的 diff"}, status_code=409)
+
+            tracked = subprocess.run(
+                ["git", "ls-files", "--error-unmatch", "--", relative_path],
+                cwd=CONFIG.draft_root,
+                text=True,
+                capture_output=True,
+                timeout=CONFIG.max_timeout_seconds,
+                check=False,
+            ).returncode == 0
+            if tracked:
+                _run_checked(
+                    [
+                        "git",
+                        "restore",
+                        "--source=HEAD",
+                        "--staged",
+                        "--worktree",
+                        "--",
+                        relative_path,
+                    ],
+                    CONFIG.draft_root,
+                )
+                action = "restored"
+            else:
+                if not resolved.is_file():
+                    raise ValueError("untracked path is not a file")
+                resolved.unlink()
+                action = "deleted"
+
+        return JSONResponse({"status": "reverted", "path": relative_path, "action": action})
+    except (OSError, ValueError, RuntimeError) as error:
+        return JSONResponse({"error": str(error)}, status_code=400)
+
+
 @mcp.resource("skill://{name}")
 def skill_resource(name: str) -> str:
     """Expose a skill document as an MCP resource."""

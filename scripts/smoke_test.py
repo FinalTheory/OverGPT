@@ -3,10 +3,28 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from config import CONFIG
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
+
+
+def post_json(url: str, payload: dict[str, str]) -> dict[str, str]:
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request) as response:
+        return json.load(response)
 
 
 async def main(url: str) -> None:
@@ -40,6 +58,14 @@ async def main(url: str) -> None:
                 {
                     "path": "mymcp/.mcp-smoke-test.md",
                     "content": "# MCP smoke test\n\n写入成功。\n",
+                    "overwrite": True,
+                },
+            )
+            revert_fixture = await session.call_tool(
+                "write_workspace_file",
+                {
+                    "path": "draft/.mcp-revert-smoke-test.md",
+                    "content": "# Revert smoke test\n",
                     "overwrite": True,
                 },
             )
@@ -107,11 +133,32 @@ async def main(url: str) -> None:
                 {"language": "python", "code": "print('python execution ok')"},
             )
 
+            revert_url = f"{url.removesuffix('/mcp')}/diff/api/revert"
+            wrong_password_rejected = False
+            try:
+                post_json(
+                    revert_url,
+                    {"path": ".mcp-revert-smoke-test.md", "password": "definitely-wrong"},
+                )
+            except urllib.error.HTTPError as error:
+                wrong_password_rejected = error.code == 401
+            reverted = post_json(
+                revert_url,
+                {
+                    "path": ".mcp-revert-smoke-test.md",
+                    "password": CONFIG.draft_commit_password,
+                },
+            )
+            reverted_file = await session.call_tool(
+                "read_workspace_file", {"path": "draft/.mcp-revert-smoke-test.md"}
+            )
+
             for name, result in {
                 "list_skills": skills,
                 "list_draft_articles": articles,
                 "load_skill": loaded,
                 "write_workspace_file": written,
+                "revert_fixture": revert_fixture,
                 "read_workspace_file": read_back,
                 "read_workspace_range": ranged,
                 "read_workspace_range_anchor": anchored,
@@ -140,13 +187,18 @@ async def main(url: str) -> None:
             print("atomic edits:", "原子精确替换成功" in edited.content[0].text)
             print("unified patch:", "Patch 应用成功" in patched_file.content[0].text)
             print("bad patch rejected:", patch_rejected.isError)
+            print("revert password protected:", wrong_password_rejected)
+            print(
+                "untracked revert:",
+                reverted.get("action") == "deleted" and reverted_file.isError,
+            )
             print("python execution:", "python execution ok" in executed.content[0].text)
             cleaned = await session.call_tool(
                 "run_workspace_code",
                 {
                     "language": "shell",
-                    "code": "rm -f .mcp-smoke-test.md",
-                    "cwd": "mymcp",
+                    "code": "rm -f mymcp/.mcp-smoke-test.md draft/.mcp-revert-smoke-test.md",
+                    "cwd": ".",
                 },
             )
             if cleaned.isError:
@@ -155,6 +207,10 @@ async def main(url: str) -> None:
                 raise RuntimeError("replace_workspace_text accepted a mismatched expected_count")
             if not patch_rejected.isError:
                 raise RuntimeError("apply_workspace_patch accepted mismatched context")
+            if not wrong_password_rejected:
+                raise RuntimeError("revert endpoint accepted the wrong password")
+            if reverted.get("action") != "deleted" or not reverted_file.isError:
+                raise RuntimeError("revert endpoint did not delete the untracked fixture")
 
 
 if __name__ == "__main__":

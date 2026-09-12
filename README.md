@@ -28,7 +28,8 @@
 文件不显示。点击普通文件只显示 Git diff，不会显示完整文件内容；已删除文件只显示
 删除状态。词级高亮由 Git `--word-diff=porcelain` 生成，并使用 UTF-8 locale 处理中文。
 选择文件后可以把比较基准从 `HEAD` 切换到该文件的任意历史 commit。Commit 只提交
-当前文件，并要求后端密码校验；查看历史基准时不允许提交。
+当前文件；Revert 将 tracked 文件恢复到 `HEAD`，或删除 untracked 文件。两项操作使用
+同一个后端密码校验；查看历史基准时均不可用。
 
 ## Operations
 

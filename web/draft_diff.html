@@ -30,12 +30,13 @@
     header { position:sticky; top:0; z-index:5; flex:none; min-height:76px; display:flex; gap:16px; align-items:center; justify-content:space-between; padding:16px 24px; border-bottom:1px solid var(--line); background:rgba(255,253,248,.96); }
     #path { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .header-actions { display:flex; align-items:center; gap:8px; flex:none; }
-    #refresh, #commit { border:0; border-radius:9px; padding:10px 16px; font-weight:650; cursor:pointer; }
+    #refresh, #revert, #commit { border:0; border-radius:9px; padding:10px 16px; font-weight:650; cursor:pointer; }
     #refresh { border:1px solid var(--line); background:#f8f4ec; color:var(--ink); }
     #refresh:disabled { opacity:.55; cursor:wait; }
     #refresh.refreshing { animation:pulse .7s ease-in-out infinite alternate; }
+    #revert { border:1px solid #c78989; background:#fff8f6; color:#8b3434; }
     #commit { background:var(--accent); color:white; }
-    #commit:disabled { opacity:.4; cursor:not-allowed; }
+    #revert:disabled, #commit:disabled { opacity:.4; cursor:not-allowed; }
     @keyframes pulse { to { opacity:.55; } }
     #empty { margin:auto; color:var(--muted); text-align:center; padding:32px; }
     #diff { display:none; flex:1; min-height:0; margin:0; padding:22px 24px 80px; overflow-y:auto; overflow-x:hidden; font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; tab-size:4; }
@@ -54,6 +55,8 @@
     .actions { display:flex; justify-content:flex-end; gap:10px; margin-top:20px; }
     .actions button { border:1px solid var(--line); border-radius:8px; padding:9px 14px; cursor:pointer; background:white; }
     .actions .primary { background:var(--accent); border-color:var(--accent); color:white; }
+    .actions .danger { background:#963d3d; border-color:#963d3d; color:white; }
+    .warning { margin:0 0 14px; color:#6f3434; }
     @media (max-width:720px) {
       body { overflow:hidden; }
       .app { height:100vh; height:100dvh; grid-template-columns:1fr; grid-template-rows:auto minmax(0,1fr); }
@@ -74,7 +77,8 @@
       main { min-height:0; }
       header { min-height:58px; padding:9px 12px; }
       #path { font-size:12px; }
-      #refresh, #commit { padding:9px 12px; }
+      .header-actions { gap:6px; }
+      #refresh, #revert, #commit { padding:9px 10px; }
       #diff { flex:1; min-height:0; padding:14px 6px 60px; }
       .line { padding:0 6px; }
     }
@@ -100,7 +104,7 @@
     <main>
       <header>
         <div id="path">请选择一个文件</div>
-        <div class="header-actions"><button id="refresh" type="button">刷新</button><button id="commit" disabled>Commit</button></div>
+        <div class="header-actions"><button id="refresh" type="button">刷新</button><button id="revert" type="button" disabled>Revert</button><button id="commit" disabled>Commit</button></div>
       </header>
       <div id="empty">这里不会显示文章全文，只显示 Git diff。</div><pre id="diff"></pre>
     </main>
@@ -113,12 +117,21 @@
       <div class="actions"><button type="button" id="cancelCommit">取消</button><button class="primary" value="default">提交</button></div>
     </form>
   </dialog>
+  <dialog id="revertDialog">
+    <form method="dialog" id="revertForm">
+      <h2>撤销当前文件的修改</h2>
+      <p class="warning">文件会恢复到 HEAD；如果是未跟踪文件，则会被删除。此操作无法通过本页面撤销。</p>
+      <label for="revertPassword">密码</label><input id="revertPassword" type="password" required autocomplete="current-password">
+      <div class="actions"><button type="button" id="cancelRevert">取消</button><button class="danger" value="default">确认撤销</button></div>
+    </form>
+  </dialog>
   <script>
     const tree = document.querySelector('#tree');
     const diffBox = document.querySelector('#diff');
     const empty = document.querySelector('#empty');
     const pathLabel = document.querySelector('#path');
     const refreshButton = document.querySelector('#refresh');
+    const revertButton = document.querySelector('#revert');
     const commitButton = document.querySelector('#commit');
     const filePanel = document.querySelector('#filePanel');
     const revisionPanel = document.querySelector('#revisionPanel');
@@ -130,6 +143,9 @@
     const dialog = document.querySelector('#commitDialog');
     const form = document.querySelector('#commitForm');
     const cancelCommit = document.querySelector('#cancelCommit');
+    const revertDialog = document.querySelector('#revertDialog');
+    const revertForm = document.querySelector('#revertForm');
+    const cancelRevert = document.querySelector('#cancelRevert');
     const mobileLayout = window.matchMedia('(max-width: 720px)');
     let selectedPath = '';
     let selectedRevision = 'HEAD';
@@ -211,7 +227,7 @@
       flush();
     }
     async function loadDiff(path, button, revision='HEAD') {
-      commitButton.disabled = true;
+      revertButton.disabled = true; commitButton.disabled = true;
       document.querySelectorAll('.file').forEach(item => item.classList.remove('active'));
       const response = await fetch(`api/diff?path=${encodeURIComponent(path)}&revision=${encodeURIComponent(revision)}`);
       const data = await response.json();
@@ -221,7 +237,7 @@
       pathLabel.textContent = `draft/${path} · vs ${revisionLabel}`;
       button?.classList.add('active');
       if (data.status === 'deleted') {
-        commitButton.disabled = revision !== 'HEAD';
+        revertButton.disabled = revision !== 'HEAD'; commitButton.disabled = revision !== 'HEAD';
         diffBox.replaceChildren(); diffBox.style.display = 'none';
         empty.textContent = '这个文件已删除。'; empty.style.display = 'block';
         return;
@@ -231,7 +247,7 @@
         empty.textContent = `当前版本相对于 ${revisionLabel} 没有 diff。`; empty.style.display = 'block';
         return;
       }
-      commitButton.disabled = revision !== 'HEAD';
+      revertButton.disabled = revision !== 'HEAD'; commitButton.disabled = revision !== 'HEAD';
       empty.style.display = 'none'; diffBox.style.display = 'block'; paintDiff(data.diff);
     }
     async function selectFile(path, button) {
@@ -263,7 +279,7 @@
           await showRevisionPanel(currentPath, currentRevision);
           requestAnimationFrame(() => { diffBox.scrollTop = diffScrollTop; sidebar.scrollTop = sidebarScrollTop; });
         } else if (currentPath) {
-          selectedPath = ''; selectedRevision = 'HEAD'; commitButton.disabled = true;
+          selectedPath = ''; selectedRevision = 'HEAD'; revertButton.disabled = true; commitButton.disabled = true;
           pathLabel.textContent = `draft/${currentPath}`;
           diffBox.replaceChildren(); diffBox.style.display = 'none';
           empty.textContent = '这个文件当前已经没有 diff。'; empty.style.display = 'block';
@@ -294,6 +310,17 @@
       const data = await response.json();
       if (!response.ok) return alert(data.error || '提交失败');
       dialog.close(); alert(`提交成功：${data.commit}`); await refreshView();
+    });
+    revertButton.addEventListener('click', () => {
+      document.querySelector('#revertPassword').value = ''; revertDialog.showModal();
+    });
+    cancelRevert.addEventListener('click', () => revertDialog.close());
+    revertForm.addEventListener('submit', async event => {
+      event.preventDefault();
+      const response = await fetch('api/revert', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path:selectedPath, password:document.querySelector('#revertPassword').value})});
+      const data = await response.json();
+      if (!response.ok) return alert(data.error || '撤销失败');
+      revertDialog.close(); alert('已经恢复到 HEAD。'); await refreshView();
     });
     if (mobileLayout.matches) filePicker.open = false;
     mobileLayout.addEventListener('change', event => { if (!event.matches) filePicker.open = true; });
