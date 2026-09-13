@@ -3,3 +3,4 @@ __pycache__/
 .mcp-smoke-test.md
 assets/
 .DS_Store
+.env

@@ -27,6 +27,24 @@ def post_json(url: str, payload: dict[str, str]) -> dict[str, str]:
         return json.load(response)
 
 
+def structured_result(result) -> dict[str, object]:
+    payload = result.structuredContent or {}
+    nested = payload.get("result")
+    return nested if isinstance(nested, dict) else payload
+
+
+async def wait_for_task(session: ClientSession, task_id: str) -> dict[str, object]:
+    for _ in range(100):
+        result = await session.call_tool("get_workspace_task", {"task_id": task_id})
+        if result.isError:
+            raise RuntimeError(f"get_workspace_task failed: {result}")
+        payload = structured_result(result)
+        if payload["status"] in {"succeeded", "failed", "timed_out"}:
+            return payload
+        await asyncio.sleep(0.1)
+    raise RuntimeError(f"background task did not finish: {task_id}")
+
+
 async def main(url: str) -> None:
     async with streamablehttp_client(url) as (read_stream, write_stream, _):
         async with ClientSession(read_stream, write_stream) as session:
@@ -42,6 +60,7 @@ async def main(url: str) -> None:
                 "replace_workspace_text",
                 "insert_workspace_text",
                 "apply_workspace_patch",
+                "get_workspace_task",
                 "restart_mcp_server",
                 "write_workspace_file",
                 "run_workspace_code",
@@ -132,6 +151,38 @@ async def main(url: str) -> None:
                 "run_workspace_code",
                 {"language": "python", "code": "print('python execution ok')"},
             )
+            background = await session.call_tool(
+                "run_workspace_code",
+                {
+                    "language": "python",
+                    "code": (
+                        "import sys, time; "
+                        "print('background stdout'); "
+                        "print('background stderr', file=sys.stderr); "
+                        "time.sleep(0.2)"
+                    ),
+                    "background": True,
+                    "timeout_seconds": 10,
+                },
+            )
+            if background.isError:
+                raise RuntimeError(f"background run_workspace_code failed: {background}")
+            background_task_id = str(structured_result(background)["task_id"])
+            background_result = await wait_for_task(session, background_task_id)
+
+            timeout_task = await session.call_tool(
+                "run_workspace_code",
+                {
+                    "language": "python",
+                    "code": "import time; time.sleep(5)",
+                    "background": True,
+                    "timeout_seconds": 1,
+                },
+            )
+            if timeout_task.isError:
+                raise RuntimeError(f"timed background run failed to start: {timeout_task}")
+            timeout_task_id = str(structured_result(timeout_task)["task_id"])
+            timeout_result = await wait_for_task(session, timeout_task_id)
 
             revert_url = f"{url.removesuffix('/mcp')}/diff/api/revert"
             wrong_password_rejected = False
@@ -193,11 +244,22 @@ async def main(url: str) -> None:
                 reverted.get("action") == "deleted" and reverted_file.isError,
             )
             print("python execution:", "python execution ok" in executed.content[0].text)
+            print(
+                "background execution:",
+                background_result["status"] == "succeeded"
+                and "background stdout" in str(background_result["stdout_tail"])
+                and "background stderr" in str(background_result["stderr_tail"]),
+            )
+            print("background timeout:", timeout_result["status"] == "timed_out")
             cleaned = await session.call_tool(
                 "run_workspace_code",
                 {
                     "language": "shell",
-                    "code": "rm -f mymcp/.mcp-smoke-test.md draft/.mcp-revert-smoke-test.md",
+                    "code": (
+                        "rm -f mymcp/.mcp-smoke-test.md draft/.mcp-revert-smoke-test.md; "
+                        f"rm -rf -- .mcp-tasks/{background_task_id} "
+                        f".mcp-tasks/{timeout_task_id}"
+                    ),
                     "cwd": ".",
                 },
             )
@@ -211,7 +273,16 @@ async def main(url: str) -> None:
                 raise RuntimeError("revert endpoint accepted the wrong password")
             if reverted.get("action") != "deleted" or not reverted_file.isError:
                 raise RuntimeError("revert endpoint did not delete the untracked fixture")
+            if background_result["status"] != "succeeded":
+                raise RuntimeError(f"background task failed: {background_result}")
+            if "background stdout" not in str(background_result["stdout_tail"]):
+                raise RuntimeError("background stdout was not captured")
+            if "background stderr" not in str(background_result["stderr_tail"]):
+                raise RuntimeError("background stderr was not captured")
+            if timeout_result["status"] != "timed_out":
+                raise RuntimeError(f"background timeout failed: {timeout_result}")
 
 
 if __name__ == "__main__":
-    asyncio.run(main(sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8765/mcp"))
+    default_url = f"http://127.0.0.1:{CONFIG.port}{CONFIG.mcp_path}"
+    asyncio.run(main(sys.argv[1] if len(sys.argv) > 1 else default_url))

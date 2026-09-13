@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import hmac
+import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import threading
+import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -21,14 +25,17 @@ from config import CONFIG
 mcp = FastMCP(
     CONFIG.server_name,
     instructions=(
-        "This server exposes skills and a persistent shared workspace at /opt/workspace. All file paths "
-        "are relative to the workspace root. Workspace layout: skills/<name>/SKILL.md contains "
-        "reusable writing workflows; draft/<year-month>/<article>.md contains article drafts and is a Git "
-        "repository; mymcp/ contains this MCP server's code; scripts/ contains other content management scripts. Before a writing task, call "
+        f"This server exposes skills and a persistent shared workspace at {CONFIG.workspace_root}. "
+        "All file paths are relative to the workspace root. Workspace layout: "
+        f"{CONFIG.skills_dirname}/<name>/SKILL.md contains reusable writing workflows; "
+        f"{CONFIG.draft_dirname}/<year-month>/<article>.md contains article drafts and is a Git "
+        f"repository; {CONFIG.project_root.name}/ contains this MCP server's code; scripts/ contains "
+        "other content management scripts. Before a writing task, call "
         "list_skills and load the relevant skills. Use list_draft_articles to discover existing "
         "drafts before reading or editing them. Prefer read_workspace_range plus "
         "replace_workspace_text or insert_workspace_text for precise edits; their match-count "
-        "guards prevent accidental broad changes."
+        "guards prevent accidental broad changes. Use run_workspace_code(background=true) for "
+        "long-running commands, then poll get_workspace_task with the returned task_id."
     ),
     host=CONFIG.host,
     port=CONFIG.port,
@@ -119,6 +126,131 @@ def _read_workspace_text(path: str) -> tuple[Path, str]:
 def _validate_expected_count(expected_count: int) -> None:
     if expected_count < 1:
         raise ValueError("expected_count must be at least 1")
+
+
+def _execution_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    if CONFIG.execution_home:
+        environment["HOME"] = CONFIG.execution_home
+    return environment
+
+
+def _utc_now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _task_dir(task_id: str) -> Path:
+    if not re.fullmatch(r"task_[0-9a-f]{32}", task_id):
+        raise ValueError("invalid task_id")
+    resolved = (CONFIG.tasks_root / task_id).resolve()
+    if CONFIG.tasks_root not in resolved.parents:
+        raise ValueError("task path escapes the task directory")
+    return resolved
+
+
+def _write_task_json(path: Path, payload: dict[str, Any]) -> None:
+    _write_text_atomic(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+
+
+def _read_log_tail(path: Path, max_chars: int) -> str:
+    if not path.is_file() or max_chars == 0:
+        return ""
+    max_bytes = max_chars * 4
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        handle.seek(max(0, size - max_bytes))
+        return handle.read().decode("utf-8", errors="replace")[-max_chars:]
+
+
+def _worker_is_alive(pid: Any, task_id: str) -> bool:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except (OSError, ValueError):
+        return False
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            text=True,
+            capture_output=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    return result.returncode == 0 and "workspace_task_runner.py" in result.stdout and task_id in result.stdout
+
+
+def _start_workspace_task(
+    language: Literal["python", "shell"],
+    code: str,
+    working_dir: Path,
+    cwd_relative: str,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    task_id = f"task_{uuid.uuid4().hex}"
+    task_dir = _task_dir(task_id)
+    task_dir.mkdir(parents=True, exist_ok=False)
+    request_path = task_dir / "request.json"
+    status_path = task_dir / "status.json"
+    request = {
+        "task_id": task_id,
+        "language": language,
+        "code": code,
+        "cwd": str(working_dir),
+        "cwd_relative": cwd_relative,
+        "timeout_seconds": timeout_seconds,
+        "execution_home": CONFIG.execution_home or None,
+        "created_at": _utc_now(),
+    }
+    status: dict[str, Any] = {
+        "task_id": task_id,
+        "status": "queued",
+        "language": language,
+        "cwd": cwd_relative,
+        "timeout_seconds": timeout_seconds,
+        "created_at": request["created_at"],
+        "started_at": None,
+        "finished_at": None,
+        "worker_pid": None,
+        "pid": None,
+        "exit_code": None,
+        "error": None,
+    }
+    _write_task_json(request_path, request)
+    _write_task_json(status_path, status)
+
+    runner = CONFIG.project_root / "scripts" / "workspace_task_runner.py"
+    if not runner.is_file():
+        status.update(status="failed", finished_at=_utc_now(), error="task runner is unavailable")
+        _write_task_json(status_path, status)
+        raise RuntimeError(f"task runner is unavailable: {runner}")
+    try:
+        worker = subprocess.Popen(
+            [sys.executable, str(runner), str(request_path)],
+            cwd=CONFIG.project_root,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=_execution_environment(),
+            start_new_session=True,
+            close_fds=True,
+        )
+    except OSError as error:
+        status.update(status="failed", finished_at=_utc_now(), error=str(error))
+        _write_task_json(status_path, status)
+        raise RuntimeError(f"could not start background task: {error}") from error
+
+    relative_task_dir = task_dir.relative_to(CONFIG.workspace_root).as_posix()
+    return {
+        "task_id": task_id,
+        "status": "queued",
+        "task_dir": relative_task_dir,
+        "stdout_path": f"{relative_task_dir}/stdout.log",
+        "stderr_path": f"{relative_task_dir}/stderr.log",
+    }
 
 
 def _run_checked(command: list[str], cwd: Path) -> str:
@@ -523,17 +655,34 @@ def run_workspace_code(
     code: str,
     cwd: str = ".",
     timeout_seconds: int | None = None,
+    background: bool = False,
 ) -> dict[str, Any]:
     """Run Python or POSIX shell code inside the container and shared workspace.
 
     The working directory must stay inside the workspace. Use this for flexible
-    document processing when the dedicated file tools are insufficient.
+    document processing when the dedicated file tools are insufficient. Set
+    background=true for long-running work; the call returns immediately with a
+    task_id that can be passed to get_workspace_task.
     """
     working_dir = _workspace_path(cwd, must_exist=True)
     if not working_dir.is_dir():
         raise ValueError("cwd is not a directory")
 
-    timeout = timeout_seconds or CONFIG.default_timeout_seconds
+    if background:
+        timeout = (
+            timeout_seconds
+            if timeout_seconds is not None
+            else CONFIG.default_background_timeout_seconds
+        )
+        if not 1 <= timeout <= CONFIG.max_background_timeout_seconds:
+            raise ValueError(
+                "background timeout_seconds must be between 1 and "
+                f"{CONFIG.max_background_timeout_seconds}"
+            )
+        cwd_relative = working_dir.relative_to(CONFIG.workspace_root).as_posix()
+        return _start_workspace_task(language, code, working_dir, cwd_relative, timeout)
+
+    timeout = timeout_seconds if timeout_seconds is not None else CONFIG.default_timeout_seconds
     if not 1 <= timeout <= CONFIG.max_timeout_seconds:
         raise ValueError(f"timeout_seconds must be between 1 and {CONFIG.max_timeout_seconds}")
 
@@ -546,7 +695,7 @@ def run_workspace_code(
             capture_output=True,
             timeout=timeout,
             check=False,
-            env={**os.environ, "HOME": "/tmp/mcp-home"},
+            env=_execution_environment(),
         )
         stdout, stdout_truncated = _truncate(result.stdout)
         stderr, stderr_truncated = _truncate(result.stderr)
@@ -569,6 +718,46 @@ def run_workspace_code(
             "stderr": _truncate(stderr)[0],
             "timed_out": True,
         }
+
+
+@mcp.tool()
+def get_workspace_task(task_id: str, tail_chars: int = 4000) -> dict[str, Any]:
+    """Get a background workspace task's status and recent output.
+
+    task_id comes from run_workspace_code(background=true). Status is one of
+    queued, running, succeeded, failed, or timed_out. Full logs remain available
+    at the returned workspace-relative stdout_path and stderr_path.
+    """
+    if not 0 <= tail_chars <= CONFIG.task_log_tail_chars:
+        raise ValueError(f"tail_chars must be between 0 and {CONFIG.task_log_tail_chars}")
+    task_dir = _task_dir(task_id)
+    status_path = task_dir / "status.json"
+    if not status_path.is_file():
+        raise FileNotFoundError(f"unknown task: {task_id}")
+    try:
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"could not read task status: {error}") from error
+
+    if status.get("status") == "running" and not _worker_is_alive(
+        status.get("worker_pid"), task_id
+    ):
+        status.update(
+            status="failed",
+            finished_at=_utc_now(),
+            error="background worker is no longer running",
+        )
+        _write_task_json(status_path, status)
+
+    relative_task_dir = task_dir.relative_to(CONFIG.workspace_root).as_posix()
+    return {
+        **status,
+        "task_dir": relative_task_dir,
+        "stdout_path": f"{relative_task_dir}/stdout.log",
+        "stderr_path": f"{relative_task_dir}/stderr.log",
+        "stdout_tail": _read_log_tail(task_dir / "stdout.log", tail_chars),
+        "stderr_tail": _read_log_tail(task_dir / "stderr.log", tail_chars),
+    }
 
 
 @mcp.custom_route("/diff/", methods=["GET"], include_in_schema=False)
@@ -713,5 +902,7 @@ def skill_resource(name: str) -> str:
 
 if __name__ == "__main__":
     CONFIG.workspace_root.mkdir(parents=True, exist_ok=True)
-    Path("/tmp/mcp-home").mkdir(parents=True, exist_ok=True)
+    CONFIG.tasks_root.mkdir(parents=True, exist_ok=True)
+    if CONFIG.execution_home:
+        Path(CONFIG.execution_home).mkdir(parents=True, exist_ok=True)
     mcp.run(transport="streamable-http")

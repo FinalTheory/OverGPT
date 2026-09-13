@@ -2,7 +2,7 @@ services:
   mcp:
     build:
       context: .
-    container_name: writing-workspace-mcp
+    container_name: ${MCP_CONTAINER_NAME:-writing-workspace-mcp}
     restart: unless-stopped
     init: true
     user: "1000:1000"
@@ -11,21 +11,31 @@ services:
     environment:
       MCP_PROJECT_ROOT: /opt/workspace/mymcp
       MCP_WORKSPACE_ROOT: /opt/workspace
-      MCP_SKILLS_DIRNAME: skills
-      MCP_DRAFT_DIRNAME: draft
+      MCP_SKILLS_DIRNAME: ${MCP_SKILLS_DIRNAME:-skills}
+      MCP_DRAFT_DIRNAME: ${MCP_DRAFT_DIRNAME:-draft}
+      MCP_TASKS_DIRNAME: ${MCP_TASKS_DIRNAME:-.mcp-tasks}
+      MCP_DRAFT_COMMIT_PASSWORD: ${MCP_DRAFT_COMMIT_PASSWORD:-1994.2.21}
+      MCP_GIT_LOCALE: ${MCP_GIT_LOCALE:-C.utf8}
+      MCP_GIT_WORD_DIFF_REGEX: ${MCP_GIT_WORD_DIFF_REGEX:-[[:alnum:]_]+|[^[:space:]]}
+      MCP_DRAFT_HISTORY_LIMIT: ${MCP_DRAFT_HISTORY_LIMIT:-20}
+      MCP_SERVER_NAME: ${MCP_SERVER_NAME:-FinalTheory Writing Workspace}
       MCP_HOST: 0.0.0.0
-      MCP_PORT: "8765"
-      MCP_PATH: /mcp
-      MCP_DEFAULT_TIMEOUT: "30"
-      MCP_MAX_TIMEOUT: "120"
-      MCP_MAX_OUTPUT_CHARS: "50000"
-      MCP_MAX_READ_CHARS: "200000"
-      MCP_RESTART_DELAY: "2"
+      MCP_PORT: ${MCP_PORT:-8765}
+      MCP_PATH: ${MCP_PATH:-/mcp}
+      MCP_DEFAULT_TIMEOUT: ${MCP_DEFAULT_TIMEOUT:-30}
+      MCP_MAX_TIMEOUT: ${MCP_MAX_TIMEOUT:-120}
+      MCP_MAX_OUTPUT_CHARS: ${MCP_MAX_OUTPUT_CHARS:-50000}
+      MCP_MAX_READ_CHARS: ${MCP_MAX_READ_CHARS:-200000}
+      MCP_MAX_PATCH_CHARS: ${MCP_MAX_PATCH_CHARS:-2000000}
+      MCP_DEFAULT_BACKGROUND_TIMEOUT: ${MCP_DEFAULT_BACKGROUND_TIMEOUT:-21600}
+      MCP_MAX_BACKGROUND_TIMEOUT: ${MCP_MAX_BACKGROUND_TIMEOUT:-86400}
+      MCP_TASK_LOG_TAIL_CHARS: ${MCP_TASK_LOG_TAIL_CHARS:-10000}
+      MCP_EXECUTION_HOME: ${MCP_EXECUTION_HOME:-/tmp/mcp-home}
+      MCP_RESTART_DELAY: ${MCP_RESTART_DELAY:-2}
     volumes:
-      - /home/god/Dropbox/workspace:/opt/workspace:rw
-      - /home/god/Dropbox/Blog:/opt/Blog:r
+      - ${MCP_WORKSPACE_HOST_PATH:-..}:/opt/workspace:rw
     ports:
-      - "127.0.0.1:8765:8765"
+      - "${MCP_BIND_HOST:-127.0.0.1}:${MCP_PORT:-8765}:${MCP_PORT:-8765}"
     mem_limit: 1g
     cpus: 1.0
     pids_limit: 128
