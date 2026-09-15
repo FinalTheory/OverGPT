@@ -1,4 +1,4 @@
-.PHONY: doctor bootstrap build up down restart apply-config wait logs ps test login-up login-logs login-down sync-up sync-down
+.PHONY: doctor bootstrap build up down restart apply-config wait logs ps test login-up login-logs login-down sync-up sync-down force
 
 ENV_FILE ?= ./.env
 COMPOSE = docker compose --env-file $(ENV_FILE)
@@ -55,6 +55,9 @@ bootstrap: doctor
 	$(MAKE) wait ENV_FILE=$(ENV_FILE)
 	$(COMPOSE) exec -T mcp python scripts/smoke_test.py
 
+force:
+	@:
+
 sync-down:
 	@set -a; [ ! -f "$(ENV_FILE)" ] || . "$(ENV_FILE)"; set +a; \
 	if [ -z "$${MCP_SYNC_HOST:-}" ] && [ -z "$${MCP_SYNC_REMOTE_DIR:-}" ]; then \
@@ -65,10 +68,12 @@ sync-down:
 		echo "MCP_SYNC_HOST and MCP_SYNC_REMOTE_DIR must both be configured."; \
 		exit 1; \
 	}; \
-	if [ -n "$$(git status --porcelain)" ]; then \
-		echo "Refusing sync-down: local repository has uncommitted changes."; \
-		echo "Resolve or save the local changes before pulling the remote workspace."; \
-		exit 1; \
+	if [ "$(FORCE)" != "1" ] && ! echo " $(MAKECMDGOALS) " | grep -q ' force '; then \
+		if [ -n "$$(git status --porcelain)" ]; then \
+			echo "Refusing sync-down: local repository has uncommitted changes."; \
+			echo "Resolve or save the local changes, or run 'make sync-down force' (or FORCE=1) to overwrite them from remote."; \
+			exit 1; \
+		fi; \
 	fi; \
 	port="$${MCP_SYNC_PORT:-22}"; \
 	rsync $(RSYNC_FLAGS) -e "ssh -p $$port" \
