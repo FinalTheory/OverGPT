@@ -306,3 +306,29 @@ make login-forward
 部分云服务器 IP 在纯 headless 模式下会停在浏览器验证页。这种情况下设置
 `MCP_CHATGPT_BROWSER_HEADLESS=false`；主容器会自动启动不对外开放的 Xvfb 虚拟屏幕，
 让 Playwright 使用 headed Chromium。noVNC 仍然只在人工登录时按需启动。
+
+### Observe real sub-agent browser automation
+
+当提示词已经发送但输出文件没有写回时，先在 VPS 项目目录运行：
+
+```bash
+make debug-ui-up
+```
+
+然后在 Mac 本地仓库运行：
+
+```bash
+make debug-ui
+```
+
+`debug-ui` 只在 Mac 建立到本地 `6081` 的 SSH tunnel 并自动打开页面，不会在 VPS 执行
+任何命令。它观察的是实际执行 `spawn_chatgpt_subagent` 的 Xvfb，而不是会争用 profile 的
+登录容器。连接完成后再触发一个 sub-agent；调试模式会在点击发送后保留浏览器 60 秒，
+方便确认 ChatGPT 是否调用了 `writer` 工具。按 `Ctrl+C` 只关闭本地 tunnel。调试完成后，
+在 VPS 项目目录运行：
+
+```bash
+make debug-ui-down
+```
+
+正常模式仍会在发送后立即关闭浏览器。

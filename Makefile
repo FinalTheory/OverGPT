@@ -1,4 +1,4 @@
-.PHONY: doctor bootstrap build up down restart apply-config wait logs ps test login-up login-forward login-logs login-down sync-up sync-down force
+.PHONY: doctor bootstrap build up down restart apply-config wait logs ps test login-up login-forward login-logs login-down debug-ui debug-ui-up debug-ui-down sync-up sync-down force
 
 ENV_FILE ?= ./.env
 COMPOSE = docker compose --env-file $(ENV_FILE)
@@ -132,45 +132,7 @@ login-up:
 	$(COMPOSE) --profile login up -d browser-login
 
 login-forward:
-	@set -a; [ ! -f "$(ENV_FILE)" ] || . "$(ENV_FILE)"; set +a; \
-	host="$${MCP_SYNC_HOST:-}"; \
-	ssh_port="$${MCP_SYNC_PORT:-22}"; \
-	local_port="$${MCP_VNC_LOCAL_PORT:-6080}"; \
-	remote_port="$${MCP_VNC_PORT:-6080}"; \
-	[ -n "$$host" ] || { echo "MCP_SYNC_HOST must be set in $(ENV_FILE)."; exit 1; }; \
-	command -v ssh >/dev/null 2>&1 || { echo "ssh is required"; exit 1; }; \
-	command -v curl >/dev/null 2>&1 || { echo "curl is required"; exit 1; }; \
-	if command -v open >/dev/null 2>&1; then \
-		browser_open=open; \
-	elif command -v xdg-open >/dev/null 2>&1; then \
-		browser_open=xdg-open; \
-	else \
-		echo "Neither open nor xdg-open is available."; exit 1; \
-	fi; \
-	url="http://127.0.0.1:$$local_port/vnc.html?autoconnect=true&resize=scale"; \
-	( \
-		sleep 1; \
-		attempt=0; \
-		while [ $$attempt -lt 50 ]; do \
-			if curl -fsS "http://127.0.0.1:$$local_port/vnc.html" >/dev/null 2>&1; then \
-				"$$browser_open" "$$url"; \
-				exit 0; \
-			fi; \
-			attempt=$$((attempt + 1)); \
-			sleep 0.2; \
-		done; \
-		echo "Timed out waiting for noVNC on 127.0.0.1:$$local_port." >&2; \
-	) & \
-	opener_pid=$$!; \
-	trap 'kill "$$opener_pid" >/dev/null 2>&1 || true' EXIT INT TERM; \
-	echo "Forwarding 127.0.0.1:$$local_port to $$host:127.0.0.1:$$remote_port"; \
-	echo "Press Ctrl+C to stop the SSH tunnel."; \
-	ssh -N \
-		-o ExitOnForwardFailure=yes \
-		-o ServerAliveInterval=30 \
-		-o ServerAliveCountMax=3 \
-		-L "$$local_port:127.0.0.1:$$remote_port" \
-		-p "$$ssh_port" "$$host"
+	@sh scripts/open_vnc_tunnel.sh "$(ENV_FILE)" login
 
 login-logs:
 	$(COMPOSE) --profile login logs -f --tail=100 browser-login
@@ -178,3 +140,12 @@ login-logs:
 login-down:
 	$(COMPOSE) --profile login stop browser-login
 	$(COMPOSE) --profile login rm -f browser-login
+
+debug-ui-up:
+	$(COMPOSE) exec -T mcp sh scripts/start_debug_vnc.sh
+
+debug-ui-down:
+	-$(COMPOSE) exec -T mcp sh scripts/stop_debug_vnc.sh
+
+debug-ui-forward:
+	@sh scripts/open_vnc_tunnel.sh "$(ENV_FILE)" debug

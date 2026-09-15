@@ -30,6 +30,8 @@ SEND_BUTTON_SELECTORS = (
     'button[aria-label="发送消息"]',
 )
 IGNORED_CHROME_DEFAULT_ARGS = ("--use-mock-keychain",)
+DEBUG_UI_HOLD_FILE = Path("/tmp/mymcp-debug-ui/hold-browser-open")
+DEBUG_UI_HOLD_SECONDS = 60
 
 
 @contextmanager
@@ -317,6 +319,12 @@ def send_prompt(
                         "page_url": page.url,
                         "send_method": "button",
                     }
+                    if DEBUG_UI_HOLD_FILE.is_file():
+                        result["debug_hold_seconds"] = DEBUG_UI_HOLD_SECONDS
+                        for _ in range(DEBUG_UI_HOLD_SECONDS):
+                            if not DEBUG_UI_HOLD_FILE.is_file():
+                                break
+                            page.wait_for_timeout(1000)
                 finally:
                     context.close()
         except PlaywrightError as error:

@@ -26,6 +26,7 @@ services:
         target: /opt/workspace
     ports:
       - "${MCP_BIND_HOST:-127.0.0.1}:${MCP_PORT:-8765}:${MCP_PORT:-8765}"
+      - "127.0.0.1:${MCP_DEBUG_VNC_PORT:-6081}:6080"
     shm_size: 1g
     mem_limit: ${MCP_MEMORY_LIMIT:-4g}
     cpus: ${MCP_CPU_LIMIT:-2.0}
