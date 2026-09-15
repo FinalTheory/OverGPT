@@ -1,5 +1,9 @@
 __pycache__/
 *.py[cod]
+.ruff_cache/
+.mcp-tasks/
+temp/
+*.sync-conflict-*
 .mcp-smoke-test.md
 assets/
 .DS_Store

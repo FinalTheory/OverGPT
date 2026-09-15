@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import shlex
 import sys
 import urllib.error
 import urllib.request
@@ -17,6 +19,19 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
 from config import CONFIG
+
+
+PROJECT_RELATIVE_PATH = os.getenv("MCP_PROJECT_RELATIVE_PATH", "mymcp").strip().strip("/") or "."
+
+
+def project_path(name: str) -> str:
+    return name if PROJECT_RELATIVE_PATH == "." else f"{PROJECT_RELATIVE_PATH}/{name}"
+
+
+SMOKE_FILE = project_path(".mcp-smoke-test.md")
+MOVE_FILE = project_path(".mcp-move-smoke-test.md")
+MOVED_FILE = project_path(".mcp-moved-smoke-test.md")
+GUARD_FILE = project_path(".mcp-guard-smoke-test.md")
 
 
 def post_json(url: str, payload: dict[str, str]) -> dict[str, str]:
@@ -85,11 +100,11 @@ async def main(url: str) -> None:
             articles = await session.call_tool("list_draft_articles", {})
             loaded = await session.call_tool("load_skill", {"name": "red"})
             for fixture_path in (
-                "mymcp/.mcp-smoke-test.md",
+                SMOKE_FILE,
                 "draft/.mcp-revert-smoke-test.md",
-                "mymcp/.mcp-move-smoke-test.md",
-                "mymcp/.mcp-moved-smoke-test.md",
-                "mymcp/.mcp-guard-smoke-test.md",
+                MOVE_FILE,
+                MOVED_FILE,
+                GUARD_FILE,
             ):
                 existing = await session.call_tool(
                     "read_workspace_file", {"path": fixture_path}
@@ -111,7 +126,7 @@ async def main(url: str) -> None:
             written = await session.call_tool(
                 "write_workspace_file",
                 {
-                    "path": "mymcp/.mcp-smoke-test.md",
+                    "path": SMOKE_FILE,
                     "content": "# MCP smoke test\n\n写入成功。\n",
                 },
             )
@@ -123,23 +138,23 @@ async def main(url: str) -> None:
                 },
             )
             read_back = await session.call_tool(
-                "read_workspace_file", {"path": "mymcp/.mcp-smoke-test.md"}
+                "read_workspace_file", {"path": SMOKE_FILE}
             )
             guard_created = await session.call_tool(
                 "write_workspace_file",
                 {
-                    "path": "mymcp/.mcp-guard-smoke-test.md",
+                    "path": GUARD_FILE,
                     "content": "guard v1\n",
                 },
             )
             guard_read = await session.call_tool(
-                "read_workspace_file", {"path": "mymcp/.mcp-guard-smoke-test.md"}
+                "read_workspace_file", {"path": GUARD_FILE}
             )
             guard_sha = structured_result(guard_read)["sha256"]
             guard_overwrite = await session.call_tool(
                 "write_workspace_file",
                 {
-                    "path": "mymcp/.mcp-guard-smoke-test.md",
+                    "path": GUARD_FILE,
                     "content": "guard v2\n",
                     "overwrite": True,
                     "expected_sha256": guard_sha,
@@ -148,7 +163,7 @@ async def main(url: str) -> None:
             stale_overwrite = await session.call_tool(
                 "write_workspace_file",
                 {
-                    "path": "mymcp/.mcp-guard-smoke-test.md",
+                    "path": GUARD_FILE,
                     "content": "stale\n",
                     "overwrite": True,
                     "expected_sha256": guard_sha,
@@ -156,12 +171,12 @@ async def main(url: str) -> None:
             )
             listed_workspace = await session.call_tool(
                 "list_workspace",
-                {"path": "mymcp", "depth": 1, "include_hidden": True},
+                {"path": PROJECT_RELATIVE_PATH, "depth": 1, "include_hidden": True},
             )
             searched_workspace = await session.call_tool(
                 "search_workspace_text",
                 {
-                    "path": "mymcp",
+                    "path": PROJECT_RELATIVE_PATH,
                     "query": "MCP smoke test",
                     "file_glob": ".mcp-smoke-test.md",
                 },
@@ -169,7 +184,7 @@ async def main(url: str) -> None:
             move_fixture = await session.call_tool(
                 "write_workspace_file",
                 {
-                    "path": "mymcp/.mcp-move-smoke-test.md",
+                    "path": MOVE_FILE,
                     "content": "move me\n",
                 },
             )
@@ -177,8 +192,8 @@ async def main(url: str) -> None:
             moved_fixture = await session.call_tool(
                 "move_workspace_file",
                 {
-                    "source": "mymcp/.mcp-move-smoke-test.md",
-                    "destination": "mymcp/.mcp-moved-smoke-test.md",
+                    "source": MOVE_FILE,
+                    "destination": MOVED_FILE,
                     "expected_sha256": move_fixture_payload["sha256"],
                 },
             )
@@ -186,23 +201,23 @@ async def main(url: str) -> None:
             deleted_fixture = await session.call_tool(
                 "delete_workspace_file",
                 {
-                    "path": "mymcp/.mcp-moved-smoke-test.md",
+                    "path": MOVED_FILE,
                     "expected_sha256": moved_payload["sha256"],
                 },
             )
 
             ranged = await session.call_tool(
                 "read_workspace_range",
-                {"path": "mymcp/.mcp-smoke-test.md", "start_line": 1, "end_line": 2},
+                {"path": SMOKE_FILE, "start_line": 1, "end_line": 2},
             )
             anchored = await session.call_tool(
                 "read_workspace_range",
-                {"path": "mymcp/.mcp-smoke-test.md", "anchor": "写入成功", "context_lines": 1},
+                {"path": SMOKE_FILE, "anchor": "写入成功", "context_lines": 1},
             )
             replaced = await session.call_tool(
                 "replace_workspace_text",
                 {
-                    "path": "mymcp/.mcp-smoke-test.md",
+                    "path": SMOKE_FILE,
                     "old_text": "写入成功。",
                     "new_text": "精确替换成功。",
                     "expected_count": 1,
@@ -211,7 +226,7 @@ async def main(url: str) -> None:
             rejected = await session.call_tool(
                 "replace_workspace_text",
                 {
-                    "path": "mymcp/.mcp-smoke-test.md",
+                    "path": SMOKE_FILE,
                     "old_text": "不存在",
                     "new_text": "不应写入",
                     "expected_count": 1,
@@ -220,7 +235,7 @@ async def main(url: str) -> None:
             inserted = await session.call_tool(
                 "insert_workspace_text",
                 {
-                    "path": "mymcp/.mcp-smoke-test.md",
+                    "path": SMOKE_FILE,
                     "anchor": "精确替换成功。",
                     "text": "原子",
                     "position": "before",
@@ -228,11 +243,11 @@ async def main(url: str) -> None:
                 },
             )
             edited = await session.call_tool(
-                "read_workspace_file", {"path": "mymcp/.mcp-smoke-test.md"}
+                "read_workspace_file", {"path": SMOKE_FILE}
             )
             patch = (
-                "--- a/mymcp/.mcp-smoke-test.md\n"
-                "+++ b/mymcp/.mcp-smoke-test.md\n"
+                f"--- a/{SMOKE_FILE}\n"
+                f"+++ b/{SMOKE_FILE}\n"
                 "@@ -1,3 +1,3 @@\n"
                 " # MCP smoke test\n"
                 " \n"
@@ -245,7 +260,7 @@ async def main(url: str) -> None:
                 "apply_workspace_patch", {"patch": bad_patch}
             )
             patched_file = await session.call_tool(
-                "read_workspace_file", {"path": "mymcp/.mcp-smoke-test.md"}
+                "read_workspace_file", {"path": SMOKE_FILE}
             )
             executed = await session.call_tool(
                 "run_workspace_code",
@@ -375,7 +390,7 @@ async def main(url: str) -> None:
             print(
                 "workspace listing:",
                 any(
-                    entry.get("path") == "mymcp/.mcp-smoke-test.md"
+                    entry.get("path") == SMOKE_FILE
                     for entry in listed_payload.get("entries", [])
                 ),
             )
@@ -408,7 +423,9 @@ async def main(url: str) -> None:
                 {
                     "language": "shell",
                     "code": (
-                        "rm -f mymcp/.mcp-smoke-test.md mymcp/.mcp-guard-smoke-test.md draft/.mcp-revert-smoke-test.md; "
+                        "rm -f -- "
+                        f"{shlex.quote(SMOKE_FILE)} {shlex.quote(GUARD_FILE)} "
+                        "draft/.mcp-revert-smoke-test.md; "
                         f"rm -rf -- .mcp-tasks/{background_task_id} "
                         f".mcp-tasks/{timeout_task_id} "
                         f".mcp-tasks/{cancellable_task_id}"
@@ -439,7 +456,7 @@ async def main(url: str) -> None:
             if not stale_overwrite.isError:
                 raise RuntimeError("write_workspace_file accepted a stale expected_sha256")
             if not any(
-                entry.get("path") == "mymcp/.mcp-smoke-test.md"
+                entry.get("path") == SMOKE_FILE
                 for entry in listed_payload.get("entries", [])
             ):
                 raise RuntimeError(f"list_workspace missed smoke fixture: {listed_payload}")

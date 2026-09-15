@@ -5,15 +5,16 @@ services:
       args:
         APP_UID: ${MCP_UID:-1000}
         APP_GID: ${MCP_GID:-1000}
-    container_name: writing-workspace-mcp
     restart: unless-stopped
     init: true
     user: "${MCP_UID:-1000}:${MCP_GID:-1000}"
-    working_dir: /opt/workspace/mymcp
+    working_dir: /opt/workspace/${MCP_PROJECT_RELATIVE_PATH:-mymcp}
     command: ["sh", "scripts/start_mcp.sh"]
     environment:
       MCP_WORKSPACE_ROOT: /opt/workspace
-      MCP_DRAFT_COMMIT_PASSWORD: ${MCP_DRAFT_COMMIT_PASSWORD:-1994.2.21}
+      MCP_PROJECT_RELATIVE_PATH: ${MCP_PROJECT_RELATIVE_PATH:-mymcp}
+      MCP_DRAFT_COMMIT_PASSWORD: ${MCP_DRAFT_COMMIT_PASSWORD:-change-this-password}
+      MCP_SERVER_NAME: ${MCP_SERVER_NAME:-Writing Workspace MCP}
       MCP_PORT: ${MCP_PORT:-8765}
       MCP_EXECUTION_HOME: /tmp/mcp-home
       MCP_CHATGPT_AUTOMATION_ENABLED: ${MCP_CHATGPT_AUTOMATION_ENABLED:-false}
@@ -43,7 +44,7 @@ services:
         APP_GID: ${MCP_GID:-1000}
     init: true
     user: "${MCP_UID:-1000}:${MCP_GID:-1000}"
-    working_dir: /opt/workspace/mymcp
+    working_dir: /opt/workspace/${MCP_PROJECT_RELATIVE_PATH:-mymcp}
     command: ["sh", "scripts/start_browser_login.sh"]
     environment:
       MCP_CHATGPT_BROWSER_EXECUTABLE: ${MCP_CHATGPT_BROWSER_EXECUTABLE:-}

@@ -45,12 +45,14 @@ class Config:
     tasks_dirname: str = ".mcp-tasks"
     temp_dirname: str = "temp"
     draft_diff_page: Path = SOURCE_ROOT / "web" / "draft_diff.html"
-    draft_commit_password: str = os.getenv("MCP_DRAFT_COMMIT_PASSWORD", "1994.2.21")
+    draft_commit_password: str = os.getenv(
+        "MCP_DRAFT_COMMIT_PASSWORD", "change-this-password"
+    )
     git_locale: str = "C.utf8"
     git_word_diff_regex: str = "[[:alnum:]_]+|[^[:space:]]"
     draft_history_limit: int = 20
 
-    server_name: str = "FinalTheory Writing Workspace"
+    server_name: str = os.getenv("MCP_SERVER_NAME", "Writing Workspace MCP")
     host: str = "0.0.0.0"
     port: int = int(os.getenv("MCP_PORT", "8765"))
     mcp_path: str = "/mcp"

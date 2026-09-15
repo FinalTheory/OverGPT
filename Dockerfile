@@ -26,7 +26,7 @@ RUN apt-get update \
 RUN groupadd --gid "${APP_GID}" workspace \
     && useradd --uid "${APP_UID}" --gid "${APP_GID}" --create-home workspace
 
-WORKDIR /opt/workspace/mymcp
+WORKDIR /opt/workspace
 
 COPY requirements.txt /tmp/requirements.txt
 COPY requirements-playwright.txt /tmp/requirements-playwright.txt
@@ -37,4 +37,4 @@ RUN pip install \
     && chmod --recursive a+rX /ms-playwright
 
 USER workspace
-CMD ["python", "server.py"]
+CMD ["sh", "-c", "cd \"/opt/workspace/${MCP_PROJECT_RELATIVE_PATH:-mymcp}\" && exec python server.py"]

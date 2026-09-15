@@ -1086,8 +1086,8 @@ def spawn_chatgpt_subagent(task: str) -> dict[str, Any]:
 def restart_mcp_server() -> dict[str, Any]:
     """Reload modified MCP Python code by safely restarting this Docker container.
 
-    Call this after changing Python files in mymcp. The tool first imports the updated
-    server in a fresh Python process. If validation succeeds, it returns a response and
+    Call this after changing the MCP server's Python source files. The tool first imports
+    the updated server in a fresh Python process. If validation succeeds, it returns a response and
     then exits; Docker's restart policy starts it again. This does not rebuild the image,
     so dependency, requirements.txt, Dockerfile, or Compose changes need host deployment.
     """

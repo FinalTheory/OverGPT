@@ -1,7 +1,7 @@
 # Writing Workspace MCP
 
 一个最小的远程 MCP 服务：让 ChatGPT 或其他 MCP 客户端发现写作 skills，
-并读写 `/home/god/Dropbox/workspace` 中的文档。
+并读写由部署配置指定的共享 workspace。
 
 ![Writing Workspace MCP icon](assets/mcp-icon-10kb.png)
 
@@ -40,6 +40,17 @@
 
 ## Operations
 
+首次部署建议先准备 `.env`，然后让 agent 或人工依次运行：
+
+```bash
+cp .env.example .env
+# edit .env
+make doctor
+make bootstrap
+```
+
+日常操作：
+
 ```bash
 make up
 make ps
@@ -48,7 +59,13 @@ make test
 make down
 ```
 
-容器内代码目录是 `/opt/workspace/mymcp`，它来自宿主机共享目录的直接挂载。
+`make doctor` 检查 `.env`、Docker/Compose 配置以及可选 remote sync 所需的 SSH/rsync 依赖；
+`make bootstrap` 会构建镜像、启动服务、等待 MCP readiness 并执行完整 smoke test。
+ChatGPT Web automation 若启用，首次部署仍需要一次人工浏览器登录来生成持久 profile。
+
+容器内部 workspace 固定挂载到 `/opt/workspace`。项目相对该 workspace 的目录由
+`MCP_PROJECT_RELATIVE_PATH` 指定，默认是 `mymcp`；这些都是容器内部布局，不依赖宿主机
+绝对路径。宿主机 workspace 由 `.env` 中的 `MCP_WORKSPACE_HOST_PATH` 选择。
 修改 `.py` 文件后执行 `make restart` 即可，无需重新构建镜像；只有
 `requirements.txt` 或 `Dockerfile` 改变时才需要 `make build`。
 Docker image、项目入口脚本和后台子进程环境都会禁用 Python 自动写入 `.pyc`，因此正常
@@ -96,12 +113,13 @@ shell `rm` / `mv` 代替已有的安全文件工具。
 直接在 macOS/Linux 运行时，子进程继承当前用户的 `HOME`，便于使用 Whisper 缓存和
 DaVinci Resolve。Docker 部署则通过 `MCP_EXECUTION_HOME=/tmp/mcp-home` 保持原行为。
 
-Compose 使用 `restart: unless-stopped`，且宿主机 Docker 服务已设置为开机启动，
-所以 VPS 或 Docker 重启后会自动恢复 MCP。GPT 修改 `mymcp` 内的 Python 后，可以调用
-`restart_mcp_server` 热加载新代码；该工具会先在新 Python 进程中执行导入校验，避免
-明显的语法或导入错误触发无休止的重启循环。
+Compose 使用 `restart: unless-stopped`；只要宿主机 Docker 服务会在启动时恢复，MCP
+容器也会自动恢复。Agent 修改项目内的 Python 后，可以调用 `restart_mcp_server` 热加载
+新代码；该工具会先在新 Python 进程中执行导入校验，避免明显的语法或导入错误触发
+无休止的重启循环。
 
-本机 endpoint: `http://127.0.0.1:8765/mcp`
+默认本机 endpoint 为 `http://127.0.0.1:8765/mcp`；可通过 `MCP_BIND_HOST` 和
+`MCP_PORT` 调整宿主机绑定。
 
 公网接入应通过宿主机 Nginx 将受保护的 HTTPS 路径反向代理到这个本机 endpoint。
 
@@ -113,18 +131,40 @@ Compose 使用 `restart: unless-stopped`，且宿主机 Docker 服务已设置�
 cp .env.example .env
 ```
 
-Docker 部署至少应设置宿主机 workspace 和 Diff 操作密码：
+Docker 部署至少应确认宿主机 workspace、容器 UID/GID 和 Diff 操作密码：
 
 ```dotenv
 MCP_WORKSPACE_HOST_PATH=/absolute/path/to/workspace
-MCP_DRAFT_COMMIT_PASSWORD=replace-with-a-secret
+MCP_PROJECT_RELATIVE_PATH=mymcp
+MCP_UID=1000
+MCP_GID=1000
+MCP_SERVER_NAME='Writing Workspace MCP'
+MCP_DRAFT_COMMIT_PASSWORD='replace-with-a-secret'
 ```
 
-Compose 会自动读取项目目录的 `.env` 并把变量映射到容器。容器内部路径保持为
+`.env.example` 是部署配置的 canonical contract；仓库中的 Makefile、Compose 和 Python 配置
+不应保存某个维护者自己的宿主机路径、SSH endpoint 或凭据。`.env` 同时保持 shell-compatible，
+因为 `make doctor` 和 remote-sync targets 会 source 它；包含空格或 shell metacharacter 的值
+应使用引号，密码推荐使用单引号。
+
+Makefile 会把 `ENV_FILE`（默认 `./.env`）显式传给 Compose；直接运行 `docker compose`
+时 Compose 仍按默认规则读取项目目录的 `.env`。容器内部 workspace 保持为
 `/opt/workspace`；`MCP_WORKSPACE_HOST_PATH` 只表示 bind mount 的宿主机路径。
 `MCP_PORT` 会同时控制服务监听端口、端口映射、Makefile 健康检查和 smoke test。
 ChatGPT profile 默认直接保存在代码库的 `chatgpt-profile/`，通过 workspace 挂载自然
 持久化，不再需要独立 volume；该目录已被 Git 和 Docker build context 忽略。
+
+如果同一个 checkout 还需要和远端工作副本双向同步，在 `.env` 中增加：
+
+```dotenv
+MCP_SYNC_HOST=user@example-host
+MCP_SYNC_PORT=22
+MCP_SYNC_REMOTE_DIR=/absolute/path/to/remote/mymcp
+```
+
+随后使用 `make sync-down` / `make sync-up`。如果 host 和 remote directory 都为空，这两个
+目标会明确跳过，因此共享仓库不依赖任何特定的 SSH 环境。`sync-down` 在本地存在 staged、
+unstaged 或 untracked 修改时会拒绝覆盖；同步策略默认不使用 `--delete`。
 
 可选的额外 bind mount 放在 `compose.additional.yaml`。默认不加载该文件，因此无需设置
 额外路径也能正常运行。需要挂载时，在 `.env` 中启用 overlay，并配置宿主机路径、容器
@@ -157,9 +197,10 @@ MCP_EXECUTION_HOME=
 通过 workspace bind mount 仍可读取它。修改 Compose 使用的变量后执行
 `make apply-config`，仅修改直接运行的 Python 配置则重启进程。
 
-`.env` 只保留机器路径、端口、密码、容器 UID/GID、资源额度以及浏览器运行模式等部署
-差异。目录结构、协议路径、超时、大小限制、Git diff 策略、任务保留期和完成标记等稳定
-策略直接定义在 `config.py`，不再在 Compose 和 `.env` 重复一份默认值。
+`.env` 只保留机器路径、SSH/sync endpoint、端口、密码、显示名、容器 UID/GID、资源额度
+以及浏览器运行模式等部署差异。目录结构、协议路径、超时、大小限制、Git diff 策略、任务
+保留期和完成标记等稳定策略直接定义在 `config.py`，不再在 Compose 和 `.env` 重复一份
+默认值。
 
 ## ChatGPT sub-agent automation
 
@@ -235,9 +276,10 @@ completion timeout:  3600 seconds
 仍在处理，`succeeded` 表示输出文件已经更新且检测到末尾标记；`failed` 或 `timed_out`
 表示没有正常完成。完整执行结果和临时页面 URL 保存在该任务的 stdout 日志中。
 
-每次发送后都会立即释放浏览器 profile，所以后续递归委派可以继续启动新对话；但两个
-发送动作若恰好同时争用同一 profile，其中一个可能失败并需要重试。ChatGPT DOM 变化或
-登录过期时，需要重新登录或更新 `chatgpt_playwright.py` 中的选择器。
+多个 sub-agent 可以并发等待结果，但共享 Chromium profile 的发送阶段会通过跨进程文件锁
+串行化：获取 profile、填写并验证 prompt、点击发送并关闭 context 后立即释放锁。这样避免
+persistent profile 的并发竞争，同时不会把整个 sub-agent completion wait 串行化。ChatGPT
+DOM 变化或登录过期时，仍需要重新登录或更新 `chatgpt_playwright.py` 中的选择器。
 
 ### VPS browser login
 
@@ -246,7 +288,7 @@ Compose 将独立浏览器 profile 挂载到宿主机，不会随容器重建而
 
 ```bash
 make login-up
-ssh -L 6080:127.0.0.1:6080 god@your-vps
+ssh -L 6080:127.0.0.1:6080 user@your-vps
 ```
 
 本地打开 `http://127.0.0.1:6080/vnc.html`，完成 ChatGPT 登录后关闭 Chromium 窗口，
