@@ -288,11 +288,18 @@ Compose 将独立浏览器 profile 挂载到宿主机，不会随容器重建而
 
 ```bash
 make login-up
-ssh -L 6080:127.0.0.1:6080 user@your-vps
 ```
 
-本地打开 `http://127.0.0.1:6080/vnc.html`，完成 ChatGPT 登录后关闭 Chromium 窗口，
-再执行 `make login-down`。noVNC 默认只绑定 VPS 回环地址，不应开放到公网。正式服务设置
+然后在已经配置 `MCP_SYNC_HOST` 和 `MCP_SYNC_PORT` 的本地仓库中运行：
+
+```bash
+make login-forward
+```
+
+该命令以前台阻塞方式建立 SSH tunnel，连接成功后自动打开 noVNC 页面；按 `Ctrl+C`
+即可关闭 tunnel。默认把本地 `6080` 转发到 VPS 的 `6080`，本地端口冲突时可以执行
+`MCP_VNC_LOCAL_PORT=6081 make login-forward`。完成 ChatGPT 登录后关闭 Chromium 窗口，
+再在 VPS 执行 `make login-down`。noVNC 默认只绑定 VPS 回环地址，不应开放到公网。正式服务设置
 `MCP_CHATGPT_BROWSER_HEADLESS=true`，并使用同一个持久 profile。Compose 只为隔离容器中
 的登录浏览器启用 `--no-sandbox`；本地直接运行时默认保持浏览器 sandbox。
 
