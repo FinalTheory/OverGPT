@@ -9,11 +9,14 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+sys.dont_write_bytecode = True
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from config import CONFIG
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
+
+from config import CONFIG
 
 
 def post_json(url: str, payload: dict[str, str]) -> dict[str, str]:
@@ -35,7 +38,10 @@ def structured_result(result) -> dict[str, object]:
 
 async def wait_for_task(session: ClientSession, task_id: str) -> dict[str, object]:
     for _ in range(100):
-        result = await session.call_tool("get_workspace_task", {"task_id": task_id})
+        result = await session.call_tool(
+            "get_workspace_task",
+            {"task_id": task_id, "wait_seconds": 1},
+        )
         if result.isError:
             raise RuntimeError(f"get_workspace_task failed: {result}")
         payload = structured_result(result)
@@ -64,6 +70,7 @@ async def main(url: str) -> None:
                 "restart_mcp_server",
                 "write_workspace_file",
                 "run_workspace_code",
+                "spawn_chatgpt_subagent",
             }
             if tool_names != expected_tools:
                 raise RuntimeError(
@@ -169,6 +176,14 @@ async def main(url: str) -> None:
                 raise RuntimeError(f"background run_workspace_code failed: {background}")
             background_task_id = str(structured_result(background)["task_id"])
             background_result = await wait_for_task(session, background_task_id)
+            background_stdout = await session.call_tool(
+                "read_workspace_file", {"path": str(background_result["stdout_path"])}
+            )
+            background_stderr = await session.call_tool(
+                "read_workspace_file", {"path": str(background_result["stderr_path"])}
+            )
+            if background_stdout.isError or background_stderr.isError:
+                raise RuntimeError("background task logs could not be read as workspace files")
 
             timeout_task = await session.call_tool(
                 "run_workspace_code",
@@ -247,8 +262,8 @@ async def main(url: str) -> None:
             print(
                 "background execution:",
                 background_result["status"] == "succeeded"
-                and "background stdout" in str(background_result["stdout_tail"])
-                and "background stderr" in str(background_result["stderr_tail"]),
+                and "background stdout" in background_stdout.content[0].text
+                and "background stderr" in background_stderr.content[0].text,
             )
             print("background timeout:", timeout_result["status"] == "timed_out")
             cleaned = await session.call_tool(
@@ -275,9 +290,9 @@ async def main(url: str) -> None:
                 raise RuntimeError("revert endpoint did not delete the untracked fixture")
             if background_result["status"] != "succeeded":
                 raise RuntimeError(f"background task failed: {background_result}")
-            if "background stdout" not in str(background_result["stdout_tail"]):
+            if "background stdout" not in background_stdout.content[0].text:
                 raise RuntimeError("background stdout was not captured")
-            if "background stderr" not in str(background_result["stderr_tail"]):
+            if "background stderr" not in background_stderr.content[0].text:
                 raise RuntimeError("background stderr was not captured")
             if timeout_result["status"] != "timed_out":
                 raise RuntimeError(f"background timeout failed: {timeout_result}")

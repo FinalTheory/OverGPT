@@ -1,0 +1,457 @@
+"""Playwright adapter for sending one prompt to ChatGPT Web."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path, PurePosixPath
+from time import monotonic, sleep
+from typing import Any
+
+sys.dont_write_bytecode = True
+from urllib.parse import urlparse
+
+COMPOSER_SELECTORS = (
+    '#prompt-textarea[contenteditable="true"]',
+    '[contenteditable="true"][data-testid="composer-input"]',
+)
+SEND_BUTTON_SELECTORS = (
+    'button[data-testid="send-button"]',
+    'button[aria-label="Send prompt"]',
+    'button[aria-label="Send message"]',
+    'button[aria-label="发送提示"]',
+    'button[aria-label="发送消息"]',
+)
+IGNORED_CHROME_DEFAULT_ARGS = ("--use-mock-keychain",)
+
+
+def render_subagent_prompt(
+    template_file: Path,
+    input_path: str,
+    output_path: str,
+    completion_sentinel: str,
+) -> str:
+    """Replace paths and the fixed completion marker in the prompt template."""
+    if not template_file.is_file():
+        raise FileNotFoundError(
+            f"ChatGPT sub-agent prompt is unavailable: {template_file}"
+        )
+    template = template_file.read_text(encoding="utf-8")
+    if (
+        not completion_sentinel
+        or "\n" in completion_sentinel
+        or "\r" in completion_sentinel
+    ):
+        raise ValueError(
+            "completion sentinel must be non-empty and contain no newlines"
+        )
+    placeholders = {
+        "{{INPUT_PATH}}": json.dumps(input_path, ensure_ascii=False),
+        "{{OUTPUT_PATH}}": json.dumps(output_path, ensure_ascii=False),
+        "{{COMPLETION_SENTINEL}}": completion_sentinel,
+    }
+    for placeholder, value in placeholders.items():
+        actual_count = template.count(placeholder)
+        if actual_count != 1:
+            raise ValueError(
+                f"prompt template must contain {placeholder} exactly once; found {actual_count}"
+            )
+        template = template.replace(placeholder, value)
+    return template
+
+
+def normalize_workspace_relative_path(relative_path: str) -> str:
+    """Normalize a remote workspace path without consulting the local filesystem."""
+    if not relative_path or "\0" in relative_path or "\\" in relative_path:
+        raise ValueError("path must be a non-empty POSIX workspace-relative path")
+    path = PurePosixPath(relative_path)
+    if path.is_absolute() or ".." in path.parts:
+        raise ValueError("path must not be absolute or escape the workspace")
+    normalized = path.as_posix()
+    if normalized in {"", "."}:
+        raise ValueError("path must identify a workspace file")
+    return normalized
+
+
+def validate_subagent_path_pair(
+    input_path: str, output_path: str, temp_dirname: str
+) -> str:
+    """Validate the lexical shape of one allocator-issued path pair."""
+    temp_parts = PurePosixPath(temp_dirname).parts
+    input_parts = PurePosixPath(input_path).parts
+    output_parts = PurePosixPath(output_path).parts
+    prefix_length = len(temp_parts)
+    expected_length = prefix_length + 2
+    if (
+        input_parts[:prefix_length] != temp_parts
+        or output_parts[:prefix_length] != temp_parts
+        or len(input_parts) != expected_length
+        or len(output_parts) != expected_length
+        or input_parts[-1] != "input.md"
+        or output_parts[-1] != "output.md"
+        or input_parts[-2] != output_parts[-2]
+        or not re.fullmatch(r"[0-9a-f]{32}", input_parts[-2])
+    ):
+        raise ValueError(
+            "paths must be one internally allocated temp/<uid>/input.md and "
+            "output.md pair"
+        )
+    return input_parts[-2]
+
+
+def normalize_workspace_file(
+    workspace_root: Path, relative_path: str, *, must_exist: bool
+) -> Path:
+    """Resolve one CLI path without allowing it to leave the workspace."""
+    workspace_root = workspace_root.resolve()
+    if not relative_path or Path(relative_path).is_absolute():
+        raise ValueError("path must be a non-empty path relative to the workspace")
+    resolved = (workspace_root / relative_path).resolve()
+    if resolved != workspace_root and workspace_root not in resolved.parents:
+        raise ValueError("path escapes the workspace")
+    if must_exist and not resolved.is_file():
+        raise FileNotFoundError(relative_path)
+    if resolved.exists() and not resolved.is_file():
+        raise ValueError("path exists and is not a file")
+    return resolved
+
+
+def _visible_locator(page: Any, selectors: tuple[str, ...], timeout_ms: int) -> Any:
+    deadline = monotonic() + timeout_ms / 1000
+    while monotonic() < deadline:
+        for selector in selectors:
+            candidates = page.locator(selector)
+            for index in range(candidates.count()):
+                candidate = candidates.nth(index)
+                if candidate.is_visible():
+                    return candidate
+        page.wait_for_timeout(150)
+    return None
+
+
+def _find_composer(page: Any, timeout_ms: int) -> Any:
+    return _visible_locator(page, COMPOSER_SELECTORS, timeout_ms)
+
+
+def _click_verified_send_button(
+    page: Any, markers: tuple[str, ...], timeout_ms: int
+) -> bool:
+    deadline = monotonic() + timeout_ms / 1000
+    while monotonic() < deadline:
+        button = _visible_locator(page, SEND_BUTTON_SELECTORS, 250)
+        if button is not None and button.is_enabled():
+            composer = _find_composer(page, 250)
+            if composer is None:
+                return False
+            text = composer.inner_text()
+            if any(marker not in text for marker in markers):
+                return False
+            button.click()
+            return True
+        page.wait_for_timeout(150)
+    return False
+
+
+def _fill_verified_prompt(
+    page: Any,
+    prompt: str,
+    markers: tuple[str, ...],
+    timeout_ms: int,
+) -> None:
+    """Fill the live editor and refuse to send if a page remount loses the prompt."""
+    deadline = monotonic() + timeout_ms / 1000
+    missing = list(markers)
+    for _ in range(3):
+        remaining_ms = round((deadline - monotonic()) * 1000)
+        if remaining_ms <= 0:
+            break
+        composer = _find_composer(page, remaining_ms)
+        if composer is None:
+            break
+        composer.fill(prompt)
+        page.wait_for_timeout(400)
+        current = _find_composer(page, min(1000, max(1, remaining_ms)))
+        if current is None:
+            continue
+        text = current.inner_text()
+        missing = [marker for marker in markers if marker not in text]
+        if not missing:
+            return
+    raise RuntimeError(
+        "ChatGPT composer lost the delegated prompt before sending; "
+        f"missing markers: {missing}"
+    )
+
+
+def _is_temporary_chat_url(url: str) -> bool:
+    query = urlparse(url).query
+    return any(
+        key == "temporary-chat" and value.lower() == "true"
+        for key, _, value in (part.partition("=") for part in query.split("&"))
+    )
+
+
+def _file_signature(path: Path) -> tuple[int, int, int] | None:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    if not path.is_file():
+        raise ValueError(f"completion path is not a file: {path}")
+    return stat.st_ino, stat.st_mtime_ns, stat.st_size
+
+
+def _file_ends_with_sentinel(path: Path, sentinel: str) -> bool:
+    encoded = sentinel.encode("utf-8")
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        handle.seek(max(0, size - len(encoded) - 1024))
+        tail = handle.read()
+    return tail.rstrip().endswith(encoded)
+
+
+def _wait_for_file_completion(
+    path: Path,
+    baseline: tuple[int, int, int] | None,
+    timeout_seconds: int,
+    sentinel: str,
+) -> float:
+    started = monotonic()
+    deadline = started + timeout_seconds
+    while monotonic() < deadline:
+        signature = _file_signature(path)
+        if (
+            signature is not None
+            and signature != baseline
+            and _file_ends_with_sentinel(path, sentinel)
+        ):
+            return monotonic() - started
+        sleep(1)
+    raise TimeoutError(
+        "output file was not updated with the completion sentinel within "
+        f"{timeout_seconds} seconds: {path}"
+    )
+
+
+def send_prompt(
+    prompt: str,
+    *,
+    url: str,
+    profile_dir: Path,
+    browser_channel: str,
+    headless: bool,
+    timeout_seconds: int,
+    verification_markers: tuple[str, ...],
+) -> dict[str, Any]:
+    """Fill and send one verified prompt, then release the browser profile."""
+    if not prompt.strip():
+        raise ValueError("prompt must not be empty")
+    if not _is_temporary_chat_url(url):
+        raise ValueError("ChatGPT automation requires a temporary-chat=true URL")
+    if timeout_seconds < 1:
+        raise ValueError("timeout_seconds must be positive")
+    if not verification_markers or any(not marker for marker in verification_markers):
+        raise ValueError("verification_markers must contain non-empty values")
+    try:
+        from playwright.sync_api import Error as PlaywrightError
+        from playwright.sync_api import sync_playwright
+    except ImportError as error:
+        raise RuntimeError(
+            "Playwright is not installed; run: "
+            "python -m pip install -r requirements-playwright.txt"
+        ) from error
+
+    profile_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        profile_dir.chmod(0o700)
+    except OSError:
+        pass
+
+    timeout_ms = timeout_seconds * 1000
+    try:
+        with sync_playwright() as playwright:
+            options: dict[str, Any] = {
+                "user_data_dir": str(profile_dir),
+                "headless": headless,
+                "ignore_default_args": list(IGNORED_CHROME_DEFAULT_ARGS),
+            }
+            if browser_channel:
+                options["channel"] = browser_channel
+            context = playwright.chromium.launch_persistent_context(**options)
+            try:
+                page = context.pages[0] if context.pages else context.new_page()
+                page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                _fill_verified_prompt(page, prompt, verification_markers, timeout_ms)
+                if not _is_temporary_chat_url(page.url):
+                    raise RuntimeError("ChatGPT left Temporary Chat before sending")
+                if not _click_verified_send_button(
+                    page, verification_markers, min(timeout_ms, 10000)
+                ):
+                    raise RuntimeError(
+                        "ChatGPT prompt changed or its send button was unavailable"
+                    )
+                result: dict[str, Any] = {
+                    "status": "sent",
+                    "page_url": page.url,
+                    "send_method": "button",
+                }
+            finally:
+                context.close()
+    except PlaywrightError as error:
+        raise RuntimeError(f"Playwright could not automate ChatGPT: {error}") from error
+
+    return result
+
+
+def _find_chrome_executable(configured: str) -> Path:
+    if configured:
+        executable = Path(configured).expanduser().resolve()
+        if not executable.is_file():
+            raise FileNotFoundError(
+                f"configured Chrome executable does not exist: {executable}"
+            )
+        return executable
+
+    candidates: list[Path] = []
+    if sys.platform == "darwin":
+        candidates.append(
+            Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+        )
+    elif sys.platform == "win32":
+        for root in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+            if value := os.getenv(root):
+                candidates.append(Path(value) / "Google/Chrome/Application/chrome.exe")
+    else:
+        for name in (
+            "google-chrome",
+            "google-chrome-stable",
+            "chromium",
+            "chromium-browser",
+        ):
+            if found := shutil.which(name):
+                candidates.append(Path(found))
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as playwright:
+            bundled_chromium = Path(playwright.chromium.executable_path)
+        if bundled_chromium.is_file():
+            return bundled_chromium.resolve()
+    except ImportError:
+        pass
+    raise FileNotFoundError(
+        "Chrome or Playwright Chromium was not found; "
+        "set MCP_CHATGPT_BROWSER_EXECUTABLE"
+    )
+
+
+def open_login_browser(
+    *, url: str, profile_dir: Path, browser_executable: str, no_sandbox: bool
+) -> None:
+    """Open ordinary Chrome so login is not performed under Playwright control."""
+    profile_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    executable = _find_chrome_executable(browser_executable)
+    print(
+        "A normal Chrome window will open with the dedicated MCP profile. "
+        "Log in to ChatGPT, then close that Chrome window to finish setup."
+    )
+    command = [
+        str(executable),
+        f"--user-data-dir={profile_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+    ]
+    if no_sandbox:
+        command.append("--no-sandbox")
+    command.append(url)
+    result = subprocess.run(command, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(f"Chrome login process exited with code {result.returncode}")
+
+
+def main() -> None:
+    from config import CONFIG
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=("login", "send", "send-and-wait"))
+    parser.add_argument(
+        "--input-path", help="workspace-relative task file used by the send action"
+    )
+    parser.add_argument(
+        "--output-path", help="workspace-relative result file used by the send action"
+    )
+    args = parser.parse_args()
+    if args.action == "login":
+        open_login_browser(
+            url=CONFIG.chatgpt_url,
+            profile_dir=CONFIG.chatgpt_profile_dir,
+            browser_executable=CONFIG.chatgpt_browser_executable,
+            no_sandbox=CONFIG.chatgpt_browser_no_sandbox,
+        )
+        return
+    if not args.input_path or not args.output_path:
+        parser.error("send requires both --input-path and --output-path")
+    normalized_input = normalize_workspace_relative_path(args.input_path)
+    normalized_output = normalize_workspace_relative_path(args.output_path)
+    if normalized_input == normalized_output:
+        parser.error("--input-path and --output-path must be different files")
+    validate_subagent_path_pair(
+        normalized_input, normalized_output, CONFIG.temp_dirname
+    )
+    prompt = render_subagent_prompt(
+        CONFIG.chatgpt_prompt_file,
+        normalized_input,
+        normalized_output,
+        CONFIG.chatgpt_completion_sentinel,
+    )
+    output_file: Path | None = None
+    output_baseline: tuple[int, int, int] | None = None
+    if args.action == "send-and-wait":
+        normalize_workspace_file(
+            CONFIG.workspace_root, normalized_input, must_exist=True
+        )
+        output_file = normalize_workspace_file(
+            CONFIG.workspace_root, normalized_output, must_exist=False
+        )
+        output_baseline = _file_signature(output_file)
+    result = send_prompt(
+        prompt,
+        url=CONFIG.chatgpt_url,
+        profile_dir=CONFIG.chatgpt_profile_dir,
+        browser_channel=CONFIG.chatgpt_browser_channel,
+        headless=CONFIG.chatgpt_browser_headless,
+        timeout_seconds=CONFIG.chatgpt_browser_timeout_seconds,
+        verification_markers=(
+            normalized_input,
+            normalized_output,
+            CONFIG.chatgpt_completion_sentinel,
+        ),
+    )
+    if output_file is not None:
+        waited = _wait_for_file_completion(
+            output_file,
+            output_baseline,
+            CONFIG.chatgpt_completion_timeout_seconds,
+            CONFIG.chatgpt_completion_sentinel,
+        )
+        result.update(
+            status="completed",
+            completion_file=str(output_file),
+            completion_wait_seconds=round(waited, 3),
+        )
+    result.update(input_path=normalized_input, output_path=normalized_output)
+    print(result)
+
+
+if __name__ == "__main__":
+    main()

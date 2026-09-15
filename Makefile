@@ -1,4 +1,4 @@
-.PHONY: build up down restart apply-config wait logs ps test
+.PHONY: build up down restart apply-config wait logs ps test login-up login-logs login-down
 
 build:
 	docker compose build
@@ -32,3 +32,14 @@ ps:
 
 test: wait
 	docker compose exec -T mcp python scripts/smoke_test.py
+
+login-up:
+	# ssh -N -L 6080:127.0.0.1:6080 -p 10023 god@170.9.29.89
+	docker compose --profile login up -d browser-login
+
+login-logs:
+	docker compose --profile login logs -f --tail=100 browser-login
+
+login-down:
+	docker compose --profile login stop browser-login
+	docker compose --profile login rm -f browser-login

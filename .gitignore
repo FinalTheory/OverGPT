@@ -4,3 +4,4 @@ __pycache__/
 assets/
 .DS_Store
 .env
+chatgpt-profile/

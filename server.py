@@ -6,21 +6,24 @@ import hmac
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
+
+sys.dont_write_bytecode = True
 
 from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 
 from config import CONFIG
-
 
 mcp = FastMCP(
     CONFIG.server_name,
@@ -35,7 +38,13 @@ mcp = FastMCP(
         "drafts before reading or editing them. Prefer read_workspace_range plus "
         "replace_workspace_text or insert_workspace_text for precise edits; their match-count "
         "guards prevent accidental broad changes. Use run_workspace_code(background=true) for "
-        "long-running commands, then poll get_workspace_task with the returned task_id."
+        "long-running commands, then poll get_workspace_task with the returned task_id; background "
+        "commands default to a one-hour timeout. To delegate to a ChatGPT sub-agent, pass its "
+        "complete task directly to spawn_chatgpt_subagent. Preserve the separately returned "
+        "output_path as the sub-agent's result file; stdout_path and stderr_path are execution "
+        "logs. Call get_workspace_task with its defaults: it waits server-side for up to 30 "
+        "seconds, returning sooner when the task finishes. If a task fails or times out, read "
+        "its returned stderr_path with the workspace file tools for diagnostics."
     ),
     host=CONFIG.host,
     port=CONFIG.port,
@@ -128,8 +137,68 @@ def _validate_expected_count(expected_count: int) -> None:
         raise ValueError("expected_count must be at least 1")
 
 
+def _render_chatgpt_subagent_prompt(input_path: str, output_path: str) -> str:
+    from chatgpt_playwright import render_subagent_prompt
+
+    return render_subagent_prompt(
+        CONFIG.chatgpt_prompt_file,
+        input_path,
+        output_path,
+        CONFIG.chatgpt_completion_sentinel,
+    )
+
+
+def _chatgpt_subagent_task_code(input_path: str, output_path: str) -> str:
+    script = CONFIG.project_root / "chatgpt_playwright.py"
+    if not script.is_file():
+        raise FileNotFoundError(f"ChatGPT Playwright runner is unavailable: {script}")
+    arguments = [
+        str(script),
+        "send-and-wait",
+        "--input-path",
+        input_path,
+        "--output-path",
+        output_path,
+    ]
+    return "\n".join(
+        [
+            "import runpy",
+            "import sys",
+            f"sys.path.insert(0, {str(CONFIG.project_root)!r})",
+            f"sys.argv = {arguments!r}",
+            f"runpy.run_path({str(script)!r}, run_name='__main__')",
+        ]
+    )
+
+
+def _allocate_subagent_files(task: str) -> dict[str, str]:
+    """Create an isolated file pair and atomically persist one delegated task."""
+    with _workspace_write_lock:
+        temp_root = _workspace_path(CONFIG.temp_dirname)
+        temp_root.mkdir(parents=True, exist_ok=True)
+        while True:
+            uid = uuid.uuid4().hex
+            allocation_dir = temp_root / uid
+            try:
+                allocation_dir.mkdir()
+                break
+            except FileExistsError:
+                continue
+
+        input_file = allocation_dir / "input.md"
+        output_file = allocation_dir / "output.md"
+        _write_text_atomic(input_file, task)
+        _write_text_atomic(output_file, "")
+
+    return {
+        "input_path": input_file.relative_to(CONFIG.workspace_root).as_posix(),
+        "output_path": output_file.relative_to(CONFIG.workspace_root).as_posix(),
+    }
+
+
 def _execution_environment() -> dict[str, str]:
     environment = os.environ.copy()
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
     if CONFIG.execution_home:
         environment["HOME"] = CONFIG.execution_home
     return environment
@@ -148,19 +217,45 @@ def _task_dir(task_id: str) -> Path:
     return resolved
 
 
+def _prune_old_workspace_tasks() -> int:
+    """Delete completed task directories older than the configured retention."""
+    if CONFIG.task_retention_days < 0:
+        raise ValueError("MCP_TASK_RETENTION_DAYS must not be negative")
+    if not CONFIG.tasks_root.is_dir():
+        return 0
+
+    cutoff = datetime.now(UTC) - timedelta(days=CONFIG.task_retention_days)
+    removed = 0
+    with _workspace_write_lock:
+        for task_dir in CONFIG.tasks_root.iterdir():
+            if (
+                not re.fullmatch(r"task_[0-9a-f]{32}", task_dir.name)
+                or task_dir.is_symlink()
+                or not task_dir.is_dir()
+            ):
+                continue
+            status_path = task_dir / "status.json"
+            try:
+                status = json.loads(status_path.read_text(encoding="utf-8"))
+                if status.get("status") not in {"succeeded", "failed", "timed_out"}:
+                    continue
+                timestamp = status.get("finished_at") or status.get("created_at")
+                if not isinstance(timestamp, str):
+                    continue
+                last_activity = datetime.fromisoformat(timestamp)
+                if last_activity.tzinfo is None:
+                    last_activity = last_activity.replace(tzinfo=UTC)
+                if last_activity.astimezone(UTC) >= cutoff:
+                    continue
+                shutil.rmtree(task_dir)
+                removed += 1
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+    return removed
+
+
 def _write_task_json(path: Path, payload: dict[str, Any]) -> None:
     _write_text_atomic(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-
-
-def _read_log_tail(path: Path, max_chars: int) -> str:
-    if not path.is_file() or max_chars == 0:
-        return ""
-    max_bytes = max_chars * 4
-    with path.open("rb") as handle:
-        handle.seek(0, os.SEEK_END)
-        size = handle.tell()
-        handle.seek(max(0, size - max_bytes))
-        return handle.read().decode("utf-8", errors="replace")[-max_chars:]
 
 
 def _worker_is_alive(pid: Any, task_id: str) -> bool:
@@ -190,6 +285,7 @@ def _start_workspace_task(
     cwd_relative: str,
     timeout_seconds: int,
 ) -> dict[str, Any]:
+    _prune_old_workspace_tasks()
     task_id = f"task_{uuid.uuid4().hex}"
     task_dir = _task_dir(task_id)
     task_dir.mkdir(parents=True, exist_ok=False)
@@ -228,7 +324,7 @@ def _start_workspace_task(
         _write_task_json(status_path, status)
         raise RuntimeError(f"task runner is unavailable: {runner}")
     try:
-        worker = subprocess.Popen(
+        subprocess.Popen(
             [sys.executable, str(runner), str(request_path)],
             cwd=CONFIG.project_root,
             stdin=subprocess.DEVNULL,
@@ -622,6 +718,61 @@ def apply_workspace_patch(patch: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+def spawn_chatgpt_subagent(task: str) -> dict[str, Any]:
+    """Asynchronously delegate one complete task to a new ChatGPT Web conversation.
+
+    Pass the complete delegated task directly. This tool allocates an isolated
+    workspace/temp/<uid>/ input/output pair, writes the task, and sends a fixed browser
+    prompt containing only those paths. It reuses the standard background task system
+    and returns a task_id immediately. input_path stores the delegated task; output_path
+    is the sub-agent's authoritative result, while stdout_path and stderr_path contain
+    execution logs. Poll get_workspace_task; succeeded means output_path changed and
+    ends with the completion sentinel. Use get_workspace_task's default server-side
+    wait while the task is active; after failure or timeout, read the returned log
+    paths with the workspace file tools. The output wait defaults to one hour.
+    """
+    if not CONFIG.chatgpt_automation_enabled:
+        raise RuntimeError(
+            "ChatGPT browser automation is disabled; set "
+            "MCP_CHATGPT_AUTOMATION_ENABLED=true for the local MCP process"
+        )
+
+    if not task.strip():
+        raise ValueError("task must not be empty")
+    if len(task) > CONFIG.max_read_chars:
+        raise ValueError(f"task exceeds the {CONFIG.max_read_chars} character limit")
+
+    allocation = _allocate_subagent_files(task)
+    normalized_input = allocation["input_path"]
+    normalized_output = allocation["output_path"]
+    _render_chatgpt_subagent_prompt(normalized_input, normalized_output)
+    task_timeout = (
+        CONFIG.chatgpt_completion_timeout_seconds
+        + CONFIG.chatgpt_browser_timeout_seconds
+        + 30
+    )
+    if task_timeout > CONFIG.max_background_timeout_seconds:
+        raise ValueError(
+            "ChatGPT completion plus browser timeout exceeds "
+            "MCP_MAX_BACKGROUND_TIMEOUT"
+        )
+    result = _start_workspace_task(
+        "python",
+        _chatgpt_subagent_task_code(normalized_input, normalized_output),
+        CONFIG.workspace_root,
+        ".",
+        task_timeout,
+    )
+    return {
+        **result,
+        "input_path": normalized_input,
+        "output_path": normalized_output,
+        "completion": "output file update plus final sentinel",
+        "message": "Sub-agent queued; poll get_workspace_task with task_id.",
+    }
+
+
+@mcp.tool()
 def restart_mcp_server() -> dict[str, Any]:
     """Reload modified MCP Python code by safely restarting this Docker container.
 
@@ -662,7 +813,8 @@ def run_workspace_code(
     The working directory must stay inside the workspace. Use this for flexible
     document processing when the dedicated file tools are insufficient. Set
     background=true for long-running work; the call returns immediately with a
-    task_id that can be passed to get_workspace_task.
+    task_id that can be passed to get_workspace_task. Background execution defaults
+    to a one-hour timeout unless timeout_seconds is provided.
     """
     working_dir = _workspace_path(cwd, must_exist=True)
     if not working_dir.is_dir():
@@ -721,33 +873,54 @@ def run_workspace_code(
 
 
 @mcp.tool()
-def get_workspace_task(task_id: str, tail_chars: int = 4000) -> dict[str, Any]:
-    """Get a background workspace task's status and recent output.
+def get_workspace_task(
+    task_id: str,
+    wait_seconds: int = CONFIG.task_default_wait_seconds,
+) -> dict[str, Any]:
+    """Wait briefly for a background task and return its status.
 
-    task_id comes from run_workspace_code(background=true). Status is one of
-    queued, running, succeeded, failed, or timed_out. Full logs remain available
-    at the returned workspace-relative stdout_path and stderr_path.
+    task_id comes from run_workspace_code(background=true) or
+    spawn_chatgpt_subagent. Status is one of queued, running, succeeded, failed,
+    or timed_out. For a ChatGPT sub-agent, succeeded means its output file was
+    updated and ends with the required sentinel. By default, this call waits
+    server-side for up to 30 seconds and returns sooner when the task reaches a
+    terminal state, reducing repeated tool calls. Set wait_seconds=0 for an immediate
+    check. This tool returns log paths, not log contents; after failure or timeout,
+    read stderr_path or stdout_path with read_workspace_file/read_workspace_range.
+    Task status and logs persist on disk rather than only in MCP memory.
     """
-    if not 0 <= tail_chars <= CONFIG.task_log_tail_chars:
-        raise ValueError(f"tail_chars must be between 0 and {CONFIG.task_log_tail_chars}")
+    if not 0 <= wait_seconds <= CONFIG.task_max_wait_seconds:
+        raise ValueError(
+            f"wait_seconds must be between 0 and {CONFIG.task_max_wait_seconds}"
+        )
     task_dir = _task_dir(task_id)
     status_path = task_dir / "status.json"
     if not status_path.is_file():
         raise FileNotFoundError(f"unknown task: {task_id}")
-    try:
-        status = json.loads(status_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise RuntimeError(f"could not read task status: {error}") from error
 
-    if status.get("status") == "running" and not _worker_is_alive(
-        status.get("worker_pid"), task_id
-    ):
-        status.update(
-            status="failed",
-            finished_at=_utc_now(),
-            error="background worker is no longer running",
-        )
-        _write_task_json(status_path, status)
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        try:
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError(f"could not read task status: {error}") from error
+
+        if status.get("status") == "running" and not _worker_is_alive(
+            status.get("worker_pid"), task_id
+        ):
+            status.update(
+                status="failed",
+                finished_at=_utc_now(),
+                error="background worker is no longer running",
+            )
+            _write_task_json(status_path, status)
+
+        if status.get("status") not in {"queued", "running"}:
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(1.0, remaining))
 
     relative_task_dir = task_dir.relative_to(CONFIG.workspace_root).as_posix()
     return {
@@ -755,8 +928,6 @@ def get_workspace_task(task_id: str, tail_chars: int = 4000) -> dict[str, Any]:
         "task_dir": relative_task_dir,
         "stdout_path": f"{relative_task_dir}/stdout.log",
         "stderr_path": f"{relative_task_dir}/stderr.log",
-        "stdout_tail": _read_log_tail(task_dir / "stdout.log", tail_chars),
-        "stderr_tail": _read_log_tail(task_dir / "stderr.log", tail_chars),
     }
 
 

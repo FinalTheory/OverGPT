@@ -1,0 +1,9 @@
+services:
+  mcp:
+    environment:
+      MCP_ADDITIONAL_ROOT: ${MCP_ADDITIONAL_CONTAINER_PATH:-/opt/additional}
+    volumes:
+      - type: bind
+        source: ${MCP_ADDITIONAL_HOST_PATH:?set MCP_ADDITIONAL_HOST_PATH}
+        target: ${MCP_ADDITIONAL_CONTAINER_PATH:-/opt/additional}
+        read_only: ${MCP_ADDITIONAL_READ_ONLY:-true}

@@ -1,0 +1,2 @@
+# Keep this exactly aligned with the browser installed by Dockerfile.
+playwright==1.62.0

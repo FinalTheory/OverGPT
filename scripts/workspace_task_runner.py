@@ -12,6 +12,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+sys.dont_write_bytecode = True
+
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
