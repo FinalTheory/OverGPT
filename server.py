@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import fnmatch
+import hashlib
 import hmac
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -35,9 +38,13 @@ mcp = FastMCP(
         f"repository; {CONFIG.project_root.name}/ contains this MCP server's code; scripts/ contains "
         "other content management scripts. Before a writing task, call "
         "list_skills and load the relevant skills. Use list_draft_articles to discover existing "
-        "drafts before reading or editing them. Prefer read_workspace_range plus "
-        "replace_workspace_text or insert_workspace_text for precise edits; their match-count "
-        "guards prevent accidental broad changes. Use run_workspace_code(background=true) for "
+        "drafts before reading or editing them. For repository work, use list_workspace and "
+        "search_workspace_text for routine navigation before falling back to shell discovery. "
+        "Prefer read_workspace_range plus replace_workspace_text or insert_workspace_text for "
+        "precise edits; their match-count guards prevent accidental broad changes. Full-file "
+        "overwrites must use expected_sha256 from a prior read to reject stale writes. Use "
+        "delete_workspace_file and move_workspace_file for ordinary file mutations instead of "
+        "shell rm/mv. Use run_workspace_code(background=true) for "
         "long-running commands, then poll get_workspace_task with the returned task_id; background "
         "commands default to a one-hour timeout. To delegate to a ChatGPT sub-agent, pass its "
         "complete task directly to spawn_chatgpt_subagent. Preserve the separately returned "
@@ -102,7 +109,11 @@ def _all_skills() -> list[dict[str, str]]:
 def _truncate(value: str) -> tuple[str, bool]:
     if len(value) <= CONFIG.max_output_chars:
         return value, False
-    return value[: CONFIG.max_output_chars], True
+    marker = "\n... output truncated; middle omitted ...\n"
+    remaining = max(0, CONFIG.max_output_chars - len(marker))
+    head = remaining // 2
+    tail = remaining - head
+    return f"{value[:head]}{marker}{value[-tail:] if tail else ''}", True
 
 
 def _write_text_atomic(path: Path, content: str) -> None:
@@ -130,6 +141,20 @@ def _read_workspace_text(path: str) -> tuple[Path, str]:
     if not resolved.is_file():
         raise ValueError("path is not a file")
     return resolved, resolved.read_text(encoding="utf-8")
+
+
+def _file_sha256(path: Path) -> str:
+    """Return a stable content hash for optimistic-concurrency checks."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_sha256(value: str) -> None:
+    if not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise ValueError("expected_sha256 must be a lowercase 64-character SHA-256 hex digest")
 
 
 def _validate_expected_count(expected_count: int) -> None:
@@ -196,6 +221,26 @@ def _execution_environment() -> dict[str, str]:
     return environment
 
 
+def _stop_process_group(process: subprocess.Popen[str]) -> None:
+    """Terminate one command and all descendants started in its process group."""
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGTERM)
+        else:
+            process.terminate()
+        process.wait(timeout=5)
+    except ProcessLookupError:
+        return
+    except subprocess.TimeoutExpired:
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGKILL)
+        else:
+            process.kill()
+        process.wait()
+
+
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -229,7 +274,7 @@ def _prune_old_workspace_tasks() -> int:
             status_path = task_dir / "status.json"
             try:
                 status = json.loads(status_path.read_text(encoding="utf-8"))
-                if status.get("status") not in {"succeeded", "failed", "timed_out"}:
+                if status.get("status") not in {"succeeded", "failed", "timed_out", "cancelled"}:
                     continue
                 timestamp = status.get("finished_at") or status.get("created_at")
                 if not isinstance(timestamp, str):
@@ -540,6 +585,7 @@ def read_workspace_file(path: str) -> dict[str, Any]:
         "content": content[: CONFIG.max_read_chars],
         "truncated": truncated,
         "size_bytes": resolved.stat().st_size,
+        "sha256": _file_sha256(resolved),
     }
 
 
@@ -558,7 +604,7 @@ def read_workspace_range(
     only anchor; it must occur exactly once, and context_lines lines are returned
     before and after it. The returned start_line/end_line identify the excerpt.
     """
-    _, content = _read_workspace_text(path)
+    resolved, content = _read_workspace_text(path)
     lines = content.splitlines(keepends=True)
     total_lines = len(lines)
 
@@ -600,21 +646,291 @@ def read_workspace_range(
         "total_lines": total_lines,
         "content": excerpt[: CONFIG.max_read_chars],
         "truncated": truncated,
+        "sha256": _file_sha256(resolved),
     }
 
 
 @mcp.tool()
-def write_workspace_file(path: str, content: str, overwrite: bool = False) -> dict[str, Any]:
+def list_workspace(
+    path: str = ".",
+    depth: int = 1,
+    include_hidden: bool = False,
+    max_entries: int = 500,
+) -> dict[str, Any]:
+    """List files and directories under one workspace-relative directory.
+
+    depth=1 lists immediate children; larger values recurse to that many levels.
+    Symlinks are skipped rather than followed. Hidden entries are omitted by default.
+    """
+    if depth < 1:
+        raise ValueError("depth must be at least 1")
+    if not 1 <= max_entries <= CONFIG.max_list_entries:
+        raise ValueError(
+            f"max_entries must be between 1 and {CONFIG.max_list_entries}"
+        )
+    root = _workspace_path(path, must_exist=True)
+    if not root.is_dir():
+        raise ValueError("path is not a directory")
+
+    entries: list[dict[str, Any]] = []
+    truncated = False
+    for current_root, dirnames, filenames in os.walk(root, followlinks=False):
+        current = Path(current_root)
+        current_depth = len(current.relative_to(root).parts)
+        if current_depth >= depth:
+            dirnames[:] = []
+            continue
+
+        visible_dirs: list[str] = []
+        for name in sorted(dirnames):
+            candidate = current / name
+            if candidate.is_symlink() or (not include_hidden and name.startswith(".")):
+                continue
+            visible_dirs.append(name)
+        dirnames[:] = visible_dirs
+
+        for name in visible_dirs:
+            candidate = current / name
+            entries.append(
+                {
+                    "path": candidate.relative_to(CONFIG.workspace_root).as_posix(),
+                    "type": "directory",
+                }
+            )
+            if len(entries) >= max_entries:
+                truncated = True
+                break
+        if truncated:
+            break
+
+        for name in sorted(filenames):
+            if not include_hidden and name.startswith("."):
+                continue
+            candidate = current / name
+            if candidate.is_symlink() or not candidate.is_file():
+                continue
+            entries.append(
+                {
+                    "path": candidate.relative_to(CONFIG.workspace_root).as_posix(),
+                    "type": "file",
+                    "size_bytes": candidate.stat().st_size,
+                }
+            )
+            if len(entries) >= max_entries:
+                truncated = True
+                break
+        if truncated:
+            break
+
+    return {
+        "path": path,
+        "depth": depth,
+        "entries": entries,
+        "truncated": truncated,
+    }
+
+
+@mcp.tool()
+def search_workspace_text(
+    path: str,
+    query: str,
+    file_glob: str = "*",
+    case_sensitive: bool = True,
+    max_results: int = 100,
+) -> dict[str, Any]:
+    """Search UTF-8 source text under one workspace path using a literal substring.
+
+    Results include workspace-relative path, 1-based line number, and matching line.
+    Common generated/runtime directories are skipped. Large or non-UTF-8 files are
+    ignored. Use file_glob such as '*.py' or '*.md' to narrow the search.
+    """
+    if not query:
+        raise ValueError("query must not be empty")
+    if not file_glob:
+        raise ValueError("file_glob must not be empty")
+    if not 1 <= max_results <= CONFIG.max_search_results:
+        raise ValueError(
+            f"max_results must be between 1 and {CONFIG.max_search_results}"
+        )
+
+    root = _workspace_path(path, must_exist=True)
+    skipped_dirnames = {
+        ".git",
+        ".mcp-tasks",
+        "chatgpt-profile",
+        "node_modules",
+        "__pycache__",
+        ".venv",
+        "venv",
+    }
+    candidates: list[Path] = []
+    if root.is_file():
+        candidates.append(root)
+    elif root.is_dir():
+        for current_root, dirnames, filenames in os.walk(root, followlinks=False):
+            current = Path(current_root)
+            dirnames[:] = [
+                name
+                for name in sorted(dirnames)
+                if name not in skipped_dirnames and not (current / name).is_symlink()
+            ]
+            for name in sorted(filenames):
+                candidate = current / name
+                if candidate.is_symlink() or not candidate.is_file():
+                    continue
+                relative_to_root = candidate.relative_to(root).as_posix()
+                if fnmatch.fnmatch(relative_to_root, file_glob):
+                    candidates.append(candidate)
+    else:
+        raise ValueError("path is neither a file nor a directory")
+
+    needle = query if case_sensitive else query.casefold()
+    results: list[dict[str, Any]] = []
+    skipped_files = 0
+    for candidate in candidates:
+        try:
+            if candidate.stat().st_size > CONFIG.max_search_file_bytes:
+                skipped_files += 1
+                continue
+            text = candidate.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            skipped_files += 1
+            continue
+        for line_number, line in enumerate(text.splitlines(), start=1):
+            haystack = line if case_sensitive else line.casefold()
+            if needle not in haystack:
+                continue
+            results.append(
+                {
+                    "path": candidate.relative_to(CONFIG.workspace_root).as_posix(),
+                    "line": line_number,
+                    "text": line[:1000],
+                }
+            )
+            if len(results) >= max_results:
+                return {
+                    "path": path,
+                    "query": query,
+                    "results": results,
+                    "truncated": True,
+                    "skipped_files": skipped_files,
+                }
+
+    return {
+        "path": path,
+        "query": query,
+        "results": results,
+        "truncated": False,
+        "skipped_files": skipped_files,
+    }
+
+
+@mcp.tool()
+def delete_workspace_file(path: str, expected_sha256: str | None = None) -> dict[str, Any]:
+    """Delete one workspace file, optionally guarded by its previously read SHA-256.
+
+    This tool never deletes directories. Pass expected_sha256 when the file was read
+    earlier and deletion should fail if another agent changed it in the meantime.
+    """
+    with _workspace_write_lock:
+        resolved = _workspace_path(path, must_exist=True)
+        if not resolved.is_file():
+            raise ValueError("path is not a file")
+        actual_sha256 = _file_sha256(resolved)
+        if expected_sha256 is not None:
+            _validate_sha256(expected_sha256)
+            if actual_sha256 != expected_sha256:
+                raise ValueError(
+                    "file changed since it was read; expected_sha256 does not match; file unchanged"
+                )
+        size_bytes = resolved.stat().st_size
+        resolved.unlink()
+    return {
+        "path": path,
+        "deleted": True,
+        "size_bytes": size_bytes,
+        "sha256": actual_sha256,
+    }
+
+
+@mcp.tool()
+def move_workspace_file(
+    source: str,
+    destination: str,
+    expected_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Atomically move or rename one workspace file without overwriting a destination.
+
+    Pass expected_sha256 to reject the move if the source changed after it was read.
+    Destination parent directories are created when needed.
+    """
+    with _workspace_write_lock:
+        source_path = _workspace_path(source, must_exist=True)
+        destination_path = _workspace_path(destination)
+        if not source_path.is_file():
+            raise ValueError("source is not a file")
+        if destination_path.exists():
+            raise FileExistsError("destination already exists")
+        actual_sha256 = _file_sha256(source_path)
+        if expected_sha256 is not None:
+            _validate_sha256(expected_sha256)
+            if actual_sha256 != expected_sha256:
+                raise ValueError(
+                    "source changed since it was read; expected_sha256 does not match; file unchanged"
+                )
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(source_path, destination_path)
+    return {
+        "source": source,
+        "destination": destination,
+        "moved": True,
+        "sha256": actual_sha256,
+    }
+
+
+@mcp.tool()
+def write_workspace_file(
+    path: str,
+    content: str,
+    overwrite: bool = False,
+    expected_sha256: str | None = None,
+) -> dict[str, Any]:
     """Write a UTF-8 document atomically inside the shared workspace.
 
-    Set overwrite=true only when replacing an existing file is intentional.
+    New files are created by default. Replacing an existing file requires
+    overwrite=true and expected_sha256 from a prior read_workspace_file or
+    read_workspace_range call. The hash guard prevents one agent from silently
+    overwriting changes made after it read the file.
     """
     with _workspace_write_lock:
         resolved = _workspace_path(path)
-        if resolved.exists() and not overwrite:
-            raise FileExistsError("file already exists; set overwrite=true to replace it")
+        existed = resolved.exists()
+        if existed:
+            if not resolved.is_file():
+                raise ValueError("path exists and is not a file")
+            if not overwrite:
+                raise FileExistsError("file already exists; set overwrite=true to replace it")
+            if expected_sha256 is None:
+                raise ValueError(
+                    "overwriting an existing file requires expected_sha256 from a prior read"
+                )
+            _validate_sha256(expected_sha256)
+            actual_sha256 = _file_sha256(resolved)
+            if actual_sha256 != expected_sha256:
+                raise ValueError(
+                    "file changed since it was read; expected_sha256 does not match; file unchanged"
+                )
+        elif expected_sha256 is not None:
+            raise ValueError("expected_sha256 was provided but the destination file does not exist")
         _write_text_atomic(resolved, content)
-    return {"path": path, "size_bytes": resolved.stat().st_size, "created": True}
+        current_sha256 = _file_sha256(resolved)
+    return {
+        "path": path,
+        "size_bytes": resolved.stat().st_size,
+        "sha256": current_sha256,
+        "created": not existed,
+        "overwritten": existed,
+    }
 
 
 @mcp.tool()
@@ -646,6 +962,7 @@ def replace_workspace_text(
         "path": path,
         "replacements": actual_count,
         "size_bytes": resolved.stat().st_size,
+        "sha256": _file_sha256(resolved),
     }
 
 
@@ -681,6 +998,7 @@ def insert_workspace_text(
         "insertions": actual_count,
         "position": position,
         "size_bytes": resolved.stat().st_size,
+        "sha256": _file_sha256(resolved),
     }
 
 
@@ -831,37 +1149,70 @@ def run_workspace_code(
         raise ValueError(f"timeout_seconds must be between 1 and {CONFIG.max_timeout_seconds}")
 
     command = ["python", "-c", code] if language == "python" else ["/bin/sh", "-c", code]
+    process = subprocess.Popen(
+        command,
+        cwd=working_dir,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=_execution_environment(),
+        start_new_session=True,
+        close_fds=True,
+    )
     try:
-        result = subprocess.run(
-            command,
-            cwd=working_dir,
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
-            env=_execution_environment(),
-        )
-        stdout, stdout_truncated = _truncate(result.stdout)
-        stderr, stderr_truncated = _truncate(result.stderr)
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _stop_process_group(process)
+        stdout, stderr = process.communicate()
+        stdout_value, stdout_truncated = _truncate(stdout or "")
+        stderr_value, stderr_truncated = _truncate(stderr or "")
         return {
-            "exit_code": result.returncode,
-            "stdout": stdout,
-            "stderr": stderr,
+            "exit_code": process.returncode,
+            "stdout": stdout_value,
+            "stderr": stderr_value,
             "truncated": stdout_truncated or stderr_truncated,
-        }
-    except subprocess.TimeoutExpired as error:
-        stdout = error.stdout or ""
-        stderr = error.stderr or ""
-        if isinstance(stdout, bytes):
-            stdout = stdout.decode(errors="replace")
-        if isinstance(stderr, bytes):
-            stderr = stderr.decode(errors="replace")
-        return {
-            "exit_code": None,
-            "stdout": _truncate(stdout)[0],
-            "stderr": _truncate(stderr)[0],
             "timed_out": True,
         }
+
+    stdout_value, stdout_truncated = _truncate(stdout or "")
+    stderr_value, stderr_truncated = _truncate(stderr or "")
+    return {
+        "exit_code": process.returncode,
+        "stdout": stdout_value,
+        "stderr": stderr_value,
+        "truncated": stdout_truncated or stderr_truncated,
+    }
+
+
+@mcp.tool()
+def cancel_workspace_task(
+    task_id: str,
+    wait_seconds: int = 5,
+) -> dict[str, Any]:
+    """Request cancellation of a queued or running background task.
+
+    The detached worker observes a persisted cancellation marker and terminates the
+    command's process group, so spawned descendants are stopped as well. This call
+    waits briefly for the task to reach a terminal state; use get_workspace_task if
+    it is still queued or running when the wait expires.
+    """
+    if not 0 <= wait_seconds <= CONFIG.task_max_wait_seconds:
+        raise ValueError(
+            f"wait_seconds must be between 0 and {CONFIG.task_max_wait_seconds}"
+        )
+    task_dir = _task_dir(task_id)
+    status_path = task_dir / "status.json"
+    if not status_path.is_file():
+        raise FileNotFoundError(f"unknown task: {task_id}")
+    try:
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"could not read task status: {error}") from error
+
+    if status.get("status") in {"queued", "running"}:
+        _write_text_atomic(task_dir / "cancel.requested", f"{_utc_now()}\n")
+    return get_workspace_task(task_id, wait_seconds=wait_seconds)
 
 
 @mcp.tool()
@@ -873,7 +1224,7 @@ def get_workspace_task(
 
     task_id comes from run_workspace_code(background=true) or
     spawn_chatgpt_subagent. Status is one of queued, running, succeeded, failed,
-    or timed_out. For a ChatGPT sub-agent, succeeded means its output file was
+    timed_out, or cancelled. For a ChatGPT sub-agent, succeeded means its output file was
     updated and ends with the required sentinel. By default, this call waits
     server-side for up to 30 seconds and returns sooner when the task reaches a
     terminal state, reducing repeated tool calls. Set wait_seconds=0 for an immediate

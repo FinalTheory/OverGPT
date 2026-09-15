@@ -10,15 +10,20 @@
 - `list_skills`：列出 `skills/*/SKILL.md`
 - `list_draft_articles`：列出 `draft` 内 Markdown 的 workspace 相对路径和第一行标题
 - `load_skill`：加载完整的 `SKILL.md`
-- `read_workspace_file`：读取共享目录内的文本文件
-- `read_workspace_range`：按行号范围或唯一锚点读取局部上下文
-- `write_workspace_file`：原子写入共享目录内的文本文件
+- `read_workspace_file`：读取共享目录内的文本文件，并返回内容 SHA-256
+- `read_workspace_range`：按行号范围或唯一锚点读取局部上下文，并返回整文件 SHA-256
+- `list_workspace`：按有限深度列出 workspace 文件和目录
+- `search_workspace_text`：在源码文本中进行带路径和行号的 literal search
+- `write_workspace_file`：原子创建文件；覆盖已有文件时必须带上之前读取到的 SHA-256
+- `delete_workspace_file`：删除单个文件，可用 SHA-256 防止 stale delete
+- `move_workspace_file`：安全移动/重命名单个文件，不覆盖已有目标，可用 SHA-256 防止 stale move
 - `replace_workspace_text`：校验匹配次数后进行原子精确替换
 - `insert_workspace_text`：校验锚点匹配次数后在其前后原子插入
 - `apply_workspace_patch`：在全部 context 匹配时原子应用 unified diff
 - `restart_mcp_server`：校验修改后的 Python 代码，然后退出并由 Docker 自动拉起
 - `run_workspace_code`：运行 Python 或 Shell；`background=true` 可启动持久化后台任务
 - `get_workspace_task`：服务端等待并查询后台任务状态，返回 stdout/stderr 文件路径
+- `cancel_workspace_task`：请求取消后台任务，并终止其整个命令进程组
 - `spawn_chatgpt_subagent`：接收完整任务，自动分配文件并异步委派给新的 ChatGPT 网页对话
 
 所有客户端路径都相对于共享目录，例如 `draft/demo.md`。服务会拒绝绝对路径和
@@ -51,14 +56,33 @@ Docker image、项目入口脚本和后台子进程环境都会禁用 Python 自
 `PYTHONDONTWRITEBYTECODE=1`。`python -m compileall` 的目的就是生成 bytecode，不应用作
 无缓存语法检查。
 
+## Repository editing semantics
+
+日常代码仓库操作优先使用结构化 workspace tools：用 `list_workspace` / `search_workspace_text`
+定位文件，用 `read_workspace_file` / `read_workspace_range` 读取，再用
+`replace_workspace_text`、`insert_workspace_text` 或 `apply_workspace_patch` 做带当前内容校验的
+修改。`run_workspace_code` 保留为 Git、测试、构建和非常规查询的 escape hatch，不应默认用
+shell `rm` / `mv` 代替已有的安全文件工具。
+
+读取接口会返回整文件 SHA-256。`write_workspace_file` 覆盖已有文件时必须同时提供
+`overwrite=true` 和最近一次 read 返回的 `expected_sha256`；如果文件在 read→write 之间被
+另一个 agent 修改，覆盖会失败而不会产生 lost update。`delete_workspace_file` 和
+`move_workspace_file` 也接受可选的 `expected_sha256`，用于同样的 stale-operation guard。
+
+这些 guard 保护通过 MCP 文件 API 协作的并发 agent。任意外部程序或
+`run_workspace_code` 中直接修改文件的 shell 命令仍然可以绕过这套协议，因此普通文件修改应
+尽量留在结构化文件工具内。
+
 ## Background tasks
 
 长时间运行的命令应使用 `run_workspace_code(background=true)`。调用会立即返回
 `task_id`，随后用 `get_workspace_task` 查询 `queued`、`running`、`succeeded`、
-`failed` 或 `timed_out` 状态。任务元数据和完整日志保存在 workspace 下的
-`.mcp-tasks/<task_id>/`，即使 MCP HTTP 连接断开也不会丢失。同步任务默认最多运行
-120 秒；后台任务默认 1 小时、最多 24 小时。超时会终止
-整个子进程组并把状态记为 `timed_out`。任务状态和日志保存在磁盘，不依赖 MCP 进程内存；
+`failed`、`timed_out` 或 `cancelled` 状态。任务元数据和完整日志保存在 workspace 下的
+`.mcp-tasks/<task_id>/`，即使 MCP HTTP 连接断开也不会丢失。同步任务默认超时 30 秒、
+最多 120 秒；后台任务默认 1 小时、最多 24 小时。同步和后台执行在超时时都会终止整个
+子进程组，避免脚本 spawn 的后代进程残留。后台任务会把状态记为 `timed_out`；也可以用
+`cancel_workspace_task` 主动取消，worker 会持久化取消请求并终止对应命令进程组。任务状态
+和日志保存在磁盘，不依赖 MCP 进程内存；
 因此重启 MCP 不会丢失记录。每次启动新任务前，服务会删除完成超过 30 天的标准
 `.mcp-tasks/task_*` 目录；正在排队或运行、状态无法解析及名称不符合规范的目录不会删除。
 这些运行策略集中定义在 `config.py`。

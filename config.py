@@ -60,6 +60,9 @@ class Config:
     max_output_chars: int = 50_000
     max_read_chars: int = 200_000
     max_patch_chars: int = 2_000_000
+    max_list_entries: int = 2_000
+    max_search_results: int = 500
+    max_search_file_bytes: int = 2_000_000
     default_background_timeout_seconds: int = 3_600
     max_background_timeout_seconds: int = 86_400
     task_default_wait_seconds: int = 30

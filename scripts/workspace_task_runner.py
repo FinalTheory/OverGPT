@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -85,31 +86,48 @@ def main(request_path: Path) -> int:
         environment["HOME"] = execution_home
 
     process: subprocess.Popen[bytes] | None = None
+    cancel_path = task_dir / "cancel.requested"
     try:
         with stdout_path.open("ab", buffering=0) as stdout, stderr_path.open(
             "ab", buffering=0
         ) as stderr:
-            process = subprocess.Popen(
-                command,
-                cwd=request["cwd"],
-                stdin=subprocess.DEVNULL,
-                stdout=stdout,
-                stderr=stderr,
-                env=environment,
-                start_new_session=True,
-                close_fds=True,
-            )
-            status["pid"] = process.pid
-            write_json_atomic(status_path, status)
-            try:
-                exit_code = process.wait(timeout=request["timeout_seconds"])
-                status["exit_code"] = exit_code
-                status["status"] = "succeeded" if exit_code == 0 else "failed"
-            except subprocess.TimeoutExpired:
-                stop_process(process)
-                status["exit_code"] = process.returncode
-                status["status"] = "timed_out"
-                status["error"] = "background task exceeded timeout_seconds"
+            if cancel_path.exists():
+                status["status"] = "cancelled"
+                status["error"] = "background task was cancelled before execution"
+            else:
+                process = subprocess.Popen(
+                    command,
+                    cwd=request["cwd"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout,
+                    stderr=stderr,
+                    env=environment,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+                status["pid"] = process.pid
+                write_json_atomic(status_path, status)
+                deadline = time.monotonic() + request["timeout_seconds"]
+                while True:
+                    exit_code = process.poll()
+                    if exit_code is not None:
+                        status["exit_code"] = exit_code
+                        status["status"] = "succeeded" if exit_code == 0 else "failed"
+                        break
+                    if cancel_path.exists():
+                        stop_process(process)
+                        status["exit_code"] = process.returncode
+                        status["status"] = "cancelled"
+                        status["error"] = "background task was cancelled"
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        stop_process(process)
+                        status["exit_code"] = process.returncode
+                        status["status"] = "timed_out"
+                        status["error"] = "background task exceeded timeout_seconds"
+                        break
+                    time.sleep(min(0.25, remaining))
     except BaseException as error:
         if process is not None and process.poll() is None:
             stop_process(process)

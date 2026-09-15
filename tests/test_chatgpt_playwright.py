@@ -147,6 +147,96 @@ def main() -> None:
         os.environ["MCP_CHATGPT_AUTOMATION_ENABLED"] = "true"
         import server
 
+        file_api_root = "file-api"
+        created_file = server.write_workspace_file(
+            f"{file_api_root}/nested/example.py",
+            "alpha = 1\nneedle = 'present'\n",
+        )
+        initial_read = server.read_workspace_file(
+            f"{file_api_root}/nested/example.py"
+        )
+        if created_file["sha256"] != initial_read["sha256"]:
+            raise RuntimeError("write/read SHA-256 values disagree")
+        if not initial_read["sha256"] or len(initial_read["sha256"]) != 64:
+            raise RuntimeError("read_workspace_file did not return a SHA-256 digest")
+
+        overwritten_file = server.write_workspace_file(
+            f"{file_api_root}/nested/example.py",
+            "alpha = 2\nneedle = 'present'\n",
+            overwrite=True,
+            expected_sha256=initial_read["sha256"],
+        )
+        try:
+            server.write_workspace_file(
+                f"{file_api_root}/nested/example.py",
+                "stale overwrite\n",
+                overwrite=True,
+                expected_sha256=initial_read["sha256"],
+            )
+        except ValueError:
+            pass
+        else:
+            raise RuntimeError("stale full-file overwrite was accepted")
+
+        listed = server.list_workspace(file_api_root, depth=2)
+        listed_paths = {entry["path"] for entry in listed["entries"]}
+        if f"{file_api_root}/nested/example.py" not in listed_paths:
+            raise RuntimeError(f"list_workspace missed nested file: {listed}")
+
+        searched = server.search_workspace_text(
+            file_api_root,
+            "needle",
+            file_glob="*.py",
+        )
+        if not searched["results"] or searched["results"][0]["line"] != 2:
+            raise RuntimeError(f"search_workspace_text missed expected result: {searched}")
+
+        moved = server.move_workspace_file(
+            f"{file_api_root}/nested/example.py",
+            f"{file_api_root}/renamed.py",
+            expected_sha256=overwritten_file["sha256"],
+        )
+        deleted = server.delete_workspace_file(
+            f"{file_api_root}/renamed.py",
+            expected_sha256=moved["sha256"],
+        )
+        if not moved["moved"] or not deleted["deleted"]:
+            raise RuntimeError("move/delete workspace file operations failed")
+
+        synchronous_timeout = server.run_workspace_code(
+            "python",
+            (
+                "import subprocess, sys, time; "
+                "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+                "open('sync-child.pid', 'w').write(str(child.pid)); "
+                "time.sleep(60)"
+            ),
+            timeout_seconds=1,
+        )
+        if not synchronous_timeout.get("timed_out"):
+            raise RuntimeError(f"synchronous timeout was not reported: {synchronous_timeout}")
+        child_pid = int(Path(workspace, "sync-child.pid").read_text(encoding="utf-8"))
+        time.sleep(0.2)
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            pass
+        else:
+            raise RuntimeError("synchronous timeout left a descendant process running")
+
+        cancellable = server.run_workspace_code(
+            "python",
+            "import time; time.sleep(60)",
+            background=True,
+            timeout_seconds=30,
+        )
+        cancelled = server.cancel_workspace_task(
+            cancellable["task_id"],
+            wait_seconds=3,
+        )
+        if cancelled["status"] != "cancelled":
+            raise RuntimeError(f"background cancellation failed: {cancelled}")
+
         old_finished = (datetime.now(UTC) - timedelta(days=31)).isoformat()
         recent_finished = datetime.now(UTC).isoformat()
         task_fixtures = {

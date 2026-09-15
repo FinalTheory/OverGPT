@@ -63,12 +63,17 @@ async def main(url: str) -> None:
                 "load_skill",
                 "read_workspace_file",
                 "read_workspace_range",
+                "list_workspace",
+                "search_workspace_text",
+                "write_workspace_file",
+                "delete_workspace_file",
+                "move_workspace_file",
                 "replace_workspace_text",
                 "insert_workspace_text",
                 "apply_workspace_patch",
                 "get_workspace_task",
+                "cancel_workspace_task",
                 "restart_mcp_server",
-                "write_workspace_file",
                 "run_workspace_code",
                 "spawn_chatgpt_subagent",
             }
@@ -79,12 +84,35 @@ async def main(url: str) -> None:
             skills = await session.call_tool("list_skills", {})
             articles = await session.call_tool("list_draft_articles", {})
             loaded = await session.call_tool("load_skill", {"name": "red"})
+            for fixture_path in (
+                "mymcp/.mcp-smoke-test.md",
+                "draft/.mcp-revert-smoke-test.md",
+                "mymcp/.mcp-move-smoke-test.md",
+                "mymcp/.mcp-moved-smoke-test.md",
+                "mymcp/.mcp-guard-smoke-test.md",
+            ):
+                existing = await session.call_tool(
+                    "read_workspace_file", {"path": fixture_path}
+                )
+                if not existing.isError:
+                    existing_payload = structured_result(existing)
+                    removed = await session.call_tool(
+                        "delete_workspace_file",
+                        {
+                            "path": fixture_path,
+                            "expected_sha256": existing_payload["sha256"],
+                        },
+                    )
+                    if removed.isError:
+                        raise RuntimeError(
+                            f"could not clean stale smoke fixture {fixture_path}: {removed}"
+                        )
+
             written = await session.call_tool(
                 "write_workspace_file",
                 {
                     "path": "mymcp/.mcp-smoke-test.md",
                     "content": "# MCP smoke test\n\n写入成功。\n",
-                    "overwrite": True,
                 },
             )
             revert_fixture = await session.call_tool(
@@ -92,12 +120,77 @@ async def main(url: str) -> None:
                 {
                     "path": "draft/.mcp-revert-smoke-test.md",
                     "content": "# Revert smoke test\n",
-                    "overwrite": True,
                 },
             )
             read_back = await session.call_tool(
                 "read_workspace_file", {"path": "mymcp/.mcp-smoke-test.md"}
             )
+            guard_created = await session.call_tool(
+                "write_workspace_file",
+                {
+                    "path": "mymcp/.mcp-guard-smoke-test.md",
+                    "content": "guard v1\n",
+                },
+            )
+            guard_read = await session.call_tool(
+                "read_workspace_file", {"path": "mymcp/.mcp-guard-smoke-test.md"}
+            )
+            guard_sha = structured_result(guard_read)["sha256"]
+            guard_overwrite = await session.call_tool(
+                "write_workspace_file",
+                {
+                    "path": "mymcp/.mcp-guard-smoke-test.md",
+                    "content": "guard v2\n",
+                    "overwrite": True,
+                    "expected_sha256": guard_sha,
+                },
+            )
+            stale_overwrite = await session.call_tool(
+                "write_workspace_file",
+                {
+                    "path": "mymcp/.mcp-guard-smoke-test.md",
+                    "content": "stale\n",
+                    "overwrite": True,
+                    "expected_sha256": guard_sha,
+                },
+            )
+            listed_workspace = await session.call_tool(
+                "list_workspace",
+                {"path": "mymcp", "depth": 1, "include_hidden": True},
+            )
+            searched_workspace = await session.call_tool(
+                "search_workspace_text",
+                {
+                    "path": "mymcp",
+                    "query": "MCP smoke test",
+                    "file_glob": ".mcp-smoke-test.md",
+                },
+            )
+            move_fixture = await session.call_tool(
+                "write_workspace_file",
+                {
+                    "path": "mymcp/.mcp-move-smoke-test.md",
+                    "content": "move me\n",
+                },
+            )
+            move_fixture_payload = structured_result(move_fixture)
+            moved_fixture = await session.call_tool(
+                "move_workspace_file",
+                {
+                    "source": "mymcp/.mcp-move-smoke-test.md",
+                    "destination": "mymcp/.mcp-moved-smoke-test.md",
+                    "expected_sha256": move_fixture_payload["sha256"],
+                },
+            )
+            moved_payload = structured_result(moved_fixture)
+            deleted_fixture = await session.call_tool(
+                "delete_workspace_file",
+                {
+                    "path": "mymcp/.mcp-moved-smoke-test.md",
+                    "expected_sha256": moved_payload["sha256"],
+                },
+            )
+
             ranged = await session.call_tool(
                 "read_workspace_range",
                 {"path": "mymcp/.mcp-smoke-test.md", "start_line": 1, "end_line": 2},
@@ -198,6 +291,26 @@ async def main(url: str) -> None:
                 raise RuntimeError(f"timed background run failed to start: {timeout_task}")
             timeout_task_id = str(structured_result(timeout_task)["task_id"])
             timeout_result = await wait_for_task(session, timeout_task_id)
+            cancellable_task = await session.call_tool(
+                "run_workspace_code",
+                {
+                    "language": "python",
+                    "code": "import time; time.sleep(30)",
+                    "background": True,
+                    "timeout_seconds": 60,
+                },
+            )
+            if cancellable_task.isError:
+                raise RuntimeError(f"cancellable background task failed to start: {cancellable_task}")
+            cancellable_task_id = str(structured_result(cancellable_task)["task_id"])
+            cancelled_result = await session.call_tool(
+                "cancel_workspace_task",
+                {"task_id": cancellable_task_id, "wait_seconds": 3},
+            )
+            if cancelled_result.isError:
+                raise RuntimeError(f"cancel_workspace_task failed: {cancelled_result}")
+            cancelled_payload = structured_result(cancelled_result)
+
 
             revert_url = f"{url.removesuffix('/mcp')}/diff/api/revert"
             wrong_password_rejected = False
@@ -224,8 +337,15 @@ async def main(url: str) -> None:
                 "list_draft_articles": articles,
                 "load_skill": loaded,
                 "write_workspace_file": written,
+                "guard_created": guard_created,
+                "guard_read": guard_read,
+                "guard_overwrite": guard_overwrite,
                 "revert_fixture": revert_fixture,
                 "read_workspace_file": read_back,
+                "list_workspace": listed_workspace,
+                "search_workspace_text": searched_workspace,
+                "move_workspace_file": moved_fixture,
+                "delete_workspace_file": deleted_fixture,
                 "read_workspace_range": ranged,
                 "read_workspace_range_anchor": anchored,
                 "replace_workspace_text": replaced,
@@ -247,6 +367,22 @@ async def main(url: str) -> None:
             print("workspace-relative draft paths:", True)
             print("loaded red skill:", "小红书深度入口文章写作" in loaded.content[0].text)
             print("file round trip:", "写入成功" in read_back.content[0].text)
+            read_back_payload = structured_result(read_back)
+            listed_payload = structured_result(listed_workspace)
+            searched_payload = structured_result(searched_workspace)
+            print("read SHA-256:", len(str(read_back_payload.get("sha256", ""))) == 64)
+            print("stale full overwrite rejected:", stale_overwrite.isError)
+            print(
+                "workspace listing:",
+                any(
+                    entry.get("path") == "mymcp/.mcp-smoke-test.md"
+                    for entry in listed_payload.get("entries", [])
+                ),
+            )
+            print(
+                "workspace search:",
+                bool(searched_payload.get("results")),
+            )
             print("line range:", "# MCP smoke test" in ranged.content[0].text)
             print("anchor range:", "写入成功" in anchored.content[0].text)
             print("mismatch rejected:", rejected.isError)
@@ -266,14 +402,16 @@ async def main(url: str) -> None:
                 and "background stderr" in background_stderr.content[0].text,
             )
             print("background timeout:", timeout_result["status"] == "timed_out")
+            print("background cancellation:", cancelled_payload["status"] == "cancelled")
             cleaned = await session.call_tool(
                 "run_workspace_code",
                 {
                     "language": "shell",
                     "code": (
-                        "rm -f mymcp/.mcp-smoke-test.md draft/.mcp-revert-smoke-test.md; "
+                        "rm -f mymcp/.mcp-smoke-test.md mymcp/.mcp-guard-smoke-test.md draft/.mcp-revert-smoke-test.md; "
                         f"rm -rf -- .mcp-tasks/{background_task_id} "
-                        f".mcp-tasks/{timeout_task_id}"
+                        f".mcp-tasks/{timeout_task_id} "
+                        f".mcp-tasks/{cancellable_task_id}"
                     ),
                     "cwd": ".",
                 },
@@ -296,6 +434,19 @@ async def main(url: str) -> None:
                 raise RuntimeError("background stderr was not captured")
             if timeout_result["status"] != "timed_out":
                 raise RuntimeError(f"background timeout failed: {timeout_result}")
+            if len(str(read_back_payload.get("sha256", ""))) != 64:
+                raise RuntimeError("read_workspace_file did not return SHA-256")
+            if not stale_overwrite.isError:
+                raise RuntimeError("write_workspace_file accepted a stale expected_sha256")
+            if not any(
+                entry.get("path") == "mymcp/.mcp-smoke-test.md"
+                for entry in listed_payload.get("entries", [])
+            ):
+                raise RuntimeError(f"list_workspace missed smoke fixture: {listed_payload}")
+            if not searched_payload.get("results"):
+                raise RuntimeError(f"search_workspace_text missed smoke fixture: {searched_payload}")
+            if cancelled_payload["status"] != "cancelled":
+                raise RuntimeError(f"background cancellation failed: {cancelled_payload}")
 
 
 if __name__ == "__main__":
