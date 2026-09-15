@@ -149,24 +149,16 @@ def _render_chatgpt_subagent_prompt(input_path: str, output_path: str) -> str:
 
 
 def _chatgpt_subagent_task_code(input_path: str, output_path: str) -> str:
-    script = CONFIG.project_root / "chatgpt_playwright.py"
-    if not script.is_file():
-        raise FileNotFoundError(f"ChatGPT Playwright runner is unavailable: {script}")
-    arguments = [
-        str(script),
-        "send-and-wait",
-        "--input-path",
-        input_path,
-        "--output-path",
-        output_path,
-    ]
     return "\n".join(
         [
-            "import runpy",
             "import sys",
             f"sys.path.insert(0, {str(CONFIG.project_root)!r})",
-            f"sys.argv = {arguments!r}",
-            f"runpy.run_path({str(script)!r}, run_name='__main__')",
+            "from chatgpt_playwright import send_subagent_task",
+            (
+                "result = send_subagent_task("
+                f"{input_path!r}, {output_path!r}, wait_for_completion=True)"
+            ),
+            "print(result)",
         ]
     )
 

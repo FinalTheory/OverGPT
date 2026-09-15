@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from time import monotonic, sleep
-from typing import Any
+from typing import Any, Iterator
 
 sys.dont_write_bytecode = True
 from urllib.parse import urlparse
@@ -28,6 +30,19 @@ SEND_BUTTON_SELECTORS = (
     'button[aria-label="发送消息"]',
 )
 IGNORED_CHROME_DEFAULT_ARGS = ("--use-mock-keychain",)
+
+
+@contextmanager
+def _browser_profile_lock(profile_dir: Path) -> Iterator[None]:
+    """Serialize process-level access to one persistent Chromium profile."""
+    lock_path = profile_dir / ".send.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def render_subagent_prompt(
@@ -274,37 +289,38 @@ def send_prompt(
         pass
 
     timeout_ms = timeout_seconds * 1000
-    try:
-        with sync_playwright() as playwright:
-            options: dict[str, Any] = {
-                "user_data_dir": str(profile_dir),
-                "headless": headless,
-                "ignore_default_args": list(IGNORED_CHROME_DEFAULT_ARGS),
-            }
-            if browser_channel:
-                options["channel"] = browser_channel
-            context = playwright.chromium.launch_persistent_context(**options)
-            try:
-                page = context.pages[0] if context.pages else context.new_page()
-                page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-                _fill_verified_prompt(page, prompt, verification_markers, timeout_ms)
-                if not _is_temporary_chat_url(page.url):
-                    raise RuntimeError("ChatGPT left Temporary Chat before sending")
-                if not _click_verified_send_button(
-                    page, verification_markers, min(timeout_ms, 10000)
-                ):
-                    raise RuntimeError(
-                        "ChatGPT prompt changed or its send button was unavailable"
-                    )
-                result: dict[str, Any] = {
-                    "status": "sent",
-                    "page_url": page.url,
-                    "send_method": "button",
+    with _browser_profile_lock(profile_dir):
+        try:
+            with sync_playwright() as playwright:
+                options: dict[str, Any] = {
+                    "user_data_dir": str(profile_dir),
+                    "headless": headless,
+                    "ignore_default_args": list(IGNORED_CHROME_DEFAULT_ARGS),
                 }
-            finally:
-                context.close()
-    except PlaywrightError as error:
-        raise RuntimeError(f"Playwright could not automate ChatGPT: {error}") from error
+                if browser_channel:
+                    options["channel"] = browser_channel
+                context = playwright.chromium.launch_persistent_context(**options)
+                try:
+                    page = context.pages[0] if context.pages else context.new_page()
+                    page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                    _fill_verified_prompt(page, prompt, verification_markers, timeout_ms)
+                    if not _is_temporary_chat_url(page.url):
+                        raise RuntimeError("ChatGPT left Temporary Chat before sending")
+                    if not _click_verified_send_button(
+                        page, verification_markers, min(timeout_ms, 10000)
+                    ):
+                        raise RuntimeError(
+                            "ChatGPT prompt changed or its send button was unavailable"
+                        )
+                    result: dict[str, Any] = {
+                        "status": "sent",
+                        "page_url": page.url,
+                        "send_method": "button",
+                    }
+                finally:
+                    context.close()
+        except PlaywrightError as error:
+            raise RuntimeError(f"Playwright could not automate ChatGPT: {error}") from error
 
     return result
 
@@ -379,32 +395,19 @@ def open_login_browser(
         raise RuntimeError(f"Chrome login process exited with code {result.returncode}")
 
 
-def main() -> None:
+def send_subagent_task(
+    input_path: str,
+    output_path: str,
+    *,
+    wait_for_completion: bool,
+) -> dict[str, Any]:
+    """Send one allocator-issued sub-agent task and optionally wait for its file result."""
     from config import CONFIG
 
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("login", "send", "send-and-wait"))
-    parser.add_argument(
-        "--input-path", help="workspace-relative task file used by the send action"
-    )
-    parser.add_argument(
-        "--output-path", help="workspace-relative result file used by the send action"
-    )
-    args = parser.parse_args()
-    if args.action == "login":
-        open_login_browser(
-            url=CONFIG.chatgpt_url,
-            profile_dir=CONFIG.chatgpt_profile_dir,
-            browser_executable=CONFIG.chatgpt_browser_executable,
-            no_sandbox=CONFIG.chatgpt_browser_no_sandbox,
-        )
-        return
-    if not args.input_path or not args.output_path:
-        parser.error("send requires both --input-path and --output-path")
-    normalized_input = normalize_workspace_relative_path(args.input_path)
-    normalized_output = normalize_workspace_relative_path(args.output_path)
+    normalized_input = normalize_workspace_relative_path(input_path)
+    normalized_output = normalize_workspace_relative_path(output_path)
     if normalized_input == normalized_output:
-        parser.error("--input-path and --output-path must be different files")
+        raise ValueError("input_path and output_path must be different files")
     validate_subagent_path_pair(
         normalized_input, normalized_output, CONFIG.temp_dirname
     )
@@ -414,9 +417,10 @@ def main() -> None:
         normalized_output,
         CONFIG.chatgpt_completion_sentinel,
     )
+
     output_file: Path | None = None
     output_baseline: tuple[int, int, int] | None = None
-    if args.action == "send-and-wait":
+    if wait_for_completion:
         normalize_workspace_file(
             CONFIG.workspace_root, normalized_input, must_exist=True
         )
@@ -424,6 +428,7 @@ def main() -> None:
             CONFIG.workspace_root, normalized_output, must_exist=False
         )
         output_baseline = _file_signature(output_file)
+
     result = send_prompt(
         prompt,
         url=CONFIG.chatgpt_url,
@@ -450,6 +455,36 @@ def main() -> None:
             completion_wait_seconds=round(waited, 3),
         )
     result.update(input_path=normalized_input, output_path=normalized_output)
+    return result
+
+
+def main() -> None:
+    from config import CONFIG
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=("login", "send", "send-and-wait"))
+    parser.add_argument(
+        "--input-path", help="workspace-relative task file used by the send action"
+    )
+    parser.add_argument(
+        "--output-path", help="workspace-relative result file used by the send action"
+    )
+    args = parser.parse_args()
+    if args.action == "login":
+        open_login_browser(
+            url=CONFIG.chatgpt_url,
+            profile_dir=CONFIG.chatgpt_profile_dir,
+            browser_executable=CONFIG.chatgpt_browser_executable,
+            no_sandbox=CONFIG.chatgpt_browser_no_sandbox,
+        )
+        return
+    if not args.input_path or not args.output_path:
+        parser.error("send requires both --input-path and --output-path")
+    result = send_subagent_task(
+        args.input_path,
+        args.output_path,
+        wait_for_completion=args.action == "send-and-wait",
+    )
     print(result)
 
 

@@ -18,7 +18,11 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import chatgpt_playwright
-from chatgpt_playwright import _wait_for_file_completion, send_prompt
+from chatgpt_playwright import (
+    _browser_profile_lock,
+    _wait_for_file_completion,
+    send_prompt,
+)
 
 HTML = """
 <!doctype html>
@@ -104,6 +108,40 @@ def main() -> None:
         raise RuntimeError(f"completion sentinel was not detected: {result}")
     print("Playwright send and completion-sentinel flow: ok")
 
+    with tempfile.TemporaryDirectory(prefix="mymcp-lock-") as temp_dir:
+        profile = Path(temp_dir, "profile")
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        second_entered = threading.Event()
+
+        def hold_first_profile_lock() -> None:
+            with _browser_profile_lock(profile):
+                first_entered.set()
+                if not release_first.wait(2):
+                    raise RuntimeError("timed out waiting to release the first profile lock")
+
+        def acquire_second_profile_lock() -> None:
+            if not first_entered.wait(2):
+                raise RuntimeError("first profile lock was never acquired")
+            with _browser_profile_lock(profile):
+                second_entered.set()
+
+        first = threading.Thread(target=hold_first_profile_lock)
+        second = threading.Thread(target=acquire_second_profile_lock)
+        first.start()
+        second.start()
+        if not first_entered.wait(2):
+            raise RuntimeError("first profile lock was never acquired")
+        time.sleep(0.1)
+        if second_entered.is_set():
+            raise RuntimeError("shared browser profile lock did not serialize access")
+        release_first.set()
+        first.join(2)
+        second.join(2)
+        if first.is_alive() or second.is_alive() or not second_entered.is_set():
+            raise RuntimeError("shared browser profile lock did not hand off cleanly")
+    print("shared browser profile access is serialized across callers: ok")
+
     with tempfile.TemporaryDirectory(prefix="mymcp-workspace-") as workspace:
         os.environ["MCP_WORKSPACE_ROOT"] = workspace
         os.environ["MCP_CHATGPT_AUTOMATION_ENABLED"] = "true"
@@ -182,6 +220,10 @@ def main() -> None:
         task_code = mocked_start.call_args.args[1]
         if delegated_task in task_code:
             raise RuntimeError("input contents leaked into the browser prompt")
+        if "runpy" in task_code or "send_subagent_task" not in task_code:
+            raise RuntimeError(
+                "background task does not directly import the sub-agent runner"
+            )
         if (
             delegated["input_path"] not in task_code
             or delegated["output_path"] not in task_code
