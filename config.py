@@ -43,7 +43,6 @@ class Config:
     skills_dirname: str = "skills"
     draft_dirname: str = "draft"
     tasks_dirname: str = ".mcp-tasks"
-    temp_dirname: str = "temp"
     draft_diff_page: Path = SOURCE_ROOT / "web" / "draft_diff.html"
     draft_commit_password: str = os.getenv(
         "MCP_DRAFT_COMMIT_PASSWORD", "change-this-password"
@@ -60,7 +59,10 @@ class Config:
     default_timeout_seconds: int = 30
     max_timeout_seconds: int = 120
     max_output_chars: int = 50_000
+    max_foreground_capture_bytes: int = 1_000_000
+    max_background_log_bytes: int = 2_000_000
     max_read_chars: int = 200_000
+    max_anchor_scan_bytes: int = 4_000_000
     max_patch_chars: int = 2_000_000
     max_list_entries: int = 2_000
     max_search_results: int = 500
@@ -87,7 +89,6 @@ class Config:
     chatgpt_prompt_file: Path = SOURCE_ROOT / "prompts" / "chatgpt_subagent.md"
     chatgpt_browser_timeout_seconds: int = 30
     chatgpt_completion_timeout_seconds: int = 3_600
-    chatgpt_completion_sentinel: str = "WRITERSUBAGENTCOMPLETE7D3A9F6C"
 
     @property
     def skills_root(self) -> Path:
@@ -100,10 +101,6 @@ class Config:
     @property
     def tasks_root(self) -> Path:
         return (self.workspace_root / self.tasks_dirname).resolve()
-
-    @property
-    def temp_root(self) -> Path:
-        return (self.workspace_root / self.temp_dirname).resolve()
 
 
 CONFIG = Config()

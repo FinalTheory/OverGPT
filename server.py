@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import codecs
 import fnmatch
+import fcntl
 import hashlib
 import hmac
 import json
@@ -16,6 +19,7 @@ import tempfile
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
@@ -143,6 +147,55 @@ def _read_workspace_text(path: str) -> tuple[Path, str]:
     return resolved, resolved.read_text(encoding="utf-8")
 
 
+def _read_workspace_prefix(path: str) -> tuple[Path, str, bool]:
+    """Read at most max_read_chars + 1 characters without materializing the file."""
+    resolved = _workspace_path(path, must_exist=True)
+    if not resolved.is_file():
+        raise ValueError("path is not a file")
+    with resolved.open("r", encoding="utf-8") as handle:
+        content = handle.read(CONFIG.max_read_chars + 1)
+    return resolved, content[: CONFIG.max_read_chars], len(content) > CONFIG.max_read_chars
+
+
+def _read_line_range_bounded(
+    resolved: Path, start_line: int, end_line: int
+) -> tuple[str, bool, int]:
+    """Scan a line range with bounded retained data, even for pathological long lines."""
+    capture_limit = CONFIG.max_read_chars * 4 + 4
+    captured = bytearray()
+    total_lines = 0
+    truncated = False
+    with resolved.open("rb") as handle:
+        while True:
+            segment = handle.readline(capture_limit + 1)
+            if not segment:
+                break
+            total_lines += 1
+            selected = start_line <= total_lines <= end_line
+            if selected:
+                remaining = max(0, capture_limit - len(captured))
+                captured.extend(segment[:remaining])
+                if len(segment) > remaining:
+                    truncated = True
+
+            if len(segment) >= capture_limit + 1 and not segment.endswith(b"\n"):
+                if selected:
+                    truncated = True
+                while segment and not segment.endswith(b"\n"):
+                    segment = handle.readline(capture_limit + 1)
+                    if not segment:
+                        break
+
+    if end_line > total_lines:
+        raise ValueError(f"end_line exceeds file length of {total_lines} lines")
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    text = decoder.decode(bytes(captured), final=False)
+    if len(text) > CONFIG.max_read_chars:
+        text = text[: CONFIG.max_read_chars]
+        truncated = True
+    return text, truncated, total_lines
+
+
 def _file_sha256(path: Path) -> str:
     """Return a stable content hash for optimistic-concurrency checks."""
     digest = hashlib.sha256()
@@ -169,7 +222,6 @@ def _render_chatgpt_subagent_prompt(input_path: str, output_path: str) -> str:
         CONFIG.chatgpt_prompt_file,
         input_path,
         output_path,
-        CONFIG.chatgpt_completion_sentinel,
     )
 
 
@@ -188,31 +240,6 @@ def _chatgpt_subagent_task_code(input_path: str, output_path: str) -> str:
     )
 
 
-def _allocate_subagent_files(task: str) -> dict[str, str]:
-    """Create an isolated file pair and atomically persist one delegated task."""
-    with _workspace_write_lock:
-        temp_root = _workspace_path(CONFIG.temp_dirname)
-        temp_root.mkdir(parents=True, exist_ok=True)
-        while True:
-            uid = uuid.uuid4().hex
-            allocation_dir = temp_root / uid
-            try:
-                allocation_dir.mkdir()
-                break
-            except FileExistsError:
-                continue
-
-        input_file = allocation_dir / "input.md"
-        output_file = allocation_dir / "output.md"
-        _write_text_atomic(input_file, task)
-        _write_text_atomic(output_file, "")
-
-    return {
-        "input_path": input_file.relative_to(CONFIG.workspace_root).as_posix(),
-        "output_path": output_file.relative_to(CONFIG.workspace_root).as_posix(),
-    }
-
-
 def _execution_environment() -> dict[str, str]:
     environment = os.environ.copy()
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -221,23 +248,141 @@ def _execution_environment() -> dict[str, str]:
     return environment
 
 
-def _stop_process_group(process: subprocess.Popen[str]) -> None:
+_TERMINAL_TASK_STATES = {"succeeded", "failed", "timed_out", "cancelled"}
+
+
+def _proc_snapshot(pid: int) -> dict[str, Any] | None:
+    """Read Linux process identity without depending on external ps/procps."""
+    if os.name != "posix" or not isinstance(pid, int) or pid <= 0:
+        return None
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        close = stat_text.rfind(")")
+        if close < 0:
+            return None
+        fields = stat_text[close + 2 :].split()
+        if len(fields) <= 19:
+            return None
+        cmdline_raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        cmdline = " ".join(
+            part.decode("utf-8", errors="replace")
+            for part in cmdline_raw.split(b"\0")
+            if part
+        )
+        return {
+            "state": fields[0],
+            "pgrp": int(fields[2]),
+            "session": int(fields[3]),
+            "start_time": int(fields[19]),
+            "cmdline": cmdline,
+        }
+    except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError, OSError):
+        pass
+
+    # macOS has no /proc. Keep a stable start-time token plus the command line
+    # so PID reuse is still detected when the service runs directly on macOS.
+    try:
+        result = subprocess.run(
+            [
+                "ps", "-p", str(pid), "-o", "stat=", "-o", "pgid=", "-o", "sess=",
+                "-o", "lstart=", "-o", "command=",
+            ],
+            text=True,
+            capture_output=True,
+            timeout=2,
+            check=False,
+        )
+        parts = result.stdout.strip().split(None, 8)
+        if result.returncode != 0 or len(parts) < 9:
+            return None
+        return {
+            "state": parts[0][0],
+            "pgrp": int(parts[1]),
+            "session": int(parts[2]),
+            "start_time": " ".join(parts[3:8]),
+            "cmdline": parts[8],
+        }
+    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError, OSError):
+        return None
+
+
+def _process_group_members(pgid: int) -> list[int]:
+    if os.name != "posix" or not isinstance(pgid, int) or pgid <= 0:
+        return []
+    members: list[int] = []
+    proc_root = Path("/proc")
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        try:
+            result = subprocess.run(
+                ["ps", "-axo", "pid=,pgid=,stat="],
+                text=True,
+                capture_output=True,
+                timeout=2,
+                check=False,
+            )
+            if result.returncode != 0:
+                return []
+            for line in result.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 3 and int(parts[1]) == pgid and not parts[2].startswith("Z"):
+                    members.append(int(parts[0]))
+        except (FileNotFoundError, subprocess.TimeoutExpired, ValueError, OSError):
+            return []
+        return members
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        snapshot = _proc_snapshot(int(entry.name))
+        if snapshot is not None and snapshot["pgrp"] == pgid and snapshot["state"] != "Z":
+            members.append(int(entry.name))
+    return members
+
+
+def _terminate_process_group_id(pgid: int, grace_seconds: float = 5.0) -> bool:
+    """Terminate every live member of one process group, escalating after grace."""
+    if os.name != "posix":
+        return False
+    if not _process_group_members(pgid):
+        return True
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        if not _process_group_members(pgid):
+            return True
+        time.sleep(0.05)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if not _process_group_members(pgid):
+            return True
+        time.sleep(0.05)
+    return not _process_group_members(pgid)
+
+
+def _stop_process_group(process: subprocess.Popen[Any]) -> None:
     """Terminate one command and all descendants started in its process group."""
+    if os.name == "posix":
+        _terminate_process_group_id(process.pid)
+        try:
+            process.wait(timeout=1)
+        except (subprocess.TimeoutExpired, ChildProcessError):
+            pass
+        return
     if process.poll() is not None:
         return
+    process.terminate()
     try:
-        if os.name == "posix":
-            os.killpg(process.pid, signal.SIGTERM)
-        else:
-            process.terminate()
         process.wait(timeout=5)
-    except ProcessLookupError:
-        return
     except subprocess.TimeoutExpired:
-        if os.name == "posix":
-            os.killpg(process.pid, signal.SIGKILL)
-        else:
-            process.kill()
+        process.kill()
         process.wait()
 
 
@@ -254,8 +399,95 @@ def _task_dir(task_id: str) -> Path:
     return resolved
 
 
+@contextmanager
+def _task_state_lock(task_dir: Path):
+    lock_path = task_dir / ".status.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _write_task_json(path: Path, payload: dict[str, Any]) -> None:
+    _write_text_atomic(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+
+
+def _read_task_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"could not read task status: {error}") from error
+    if not isinstance(value, dict):
+        raise RuntimeError("task status is not a JSON object")
+    return value
+
+
+def _worker_is_alive(pid: Any, start_time: Any, task_id: str) -> bool:
+    if not isinstance(pid, int) or not isinstance(start_time, (int, str)):
+        return False
+    snapshot = _proc_snapshot(pid)
+    return bool(
+        snapshot
+        and snapshot["start_time"] == start_time
+        and "workspace_task_runner.py" in snapshot["cmdline"]
+        and task_id in snapshot["cmdline"]
+    )
+
+
+def _terminate_recorded_workload(status: dict[str, Any]) -> bool:
+    pid = status.get("pid")
+    start_time = status.get("pid_start_time")
+    pgid = status.get("pgid")
+    if not isinstance(pgid, int) or pgid <= 0:
+        return True
+    if not isinstance(pid, int) or not isinstance(start_time, (int, str)):
+        # Legacy/incomplete records do not contain enough identity to safely
+        # signal a possibly reused process group.
+        return not _process_group_members(pgid)
+    snapshot = _proc_snapshot(pid)
+    if snapshot is not None and snapshot["start_time"] != start_time:
+        return False
+    return _terminate_process_group_id(pgid)
+
+
+def _recover_workspace_task(task_dir: Path, task_id: str) -> dict[str, Any]:
+    status_path = task_dir / "status.json"
+    with _task_state_lock(task_dir):
+        status = _read_task_json(status_path)
+        state = status.get("status")
+        if state in _TERMINAL_TASK_STATES:
+            return status
+        if state not in {"queued", "running"}:
+            return status
+        if _worker_is_alive(
+            status.get("worker_pid"), status.get("worker_start_time"), task_id
+        ):
+            return status
+
+        cleanup_ok = _terminate_recorded_workload(status)
+        # Re-read while holding the interprocess task lock. A healthy runner uses
+        # the same lock for every transition, so a newer terminal state wins.
+        current = _read_task_json(status_path)
+        if current.get("status") in _TERMINAL_TASK_STATES:
+            return current
+        current.update(
+            status="failed",
+            finished_at=_utc_now(),
+            error=(
+                "background worker is no longer running"
+                if cleanup_ok
+                else "background worker is gone and workload identity could not be safely cleaned up"
+            ),
+        )
+        _write_task_json(status_path, current)
+        return current
+
+
 def _prune_old_workspace_tasks() -> int:
-    """Delete completed task directories older than the configured retention."""
+    """Reconcile stale tasks and delete terminal task directories past retention."""
     if CONFIG.task_retention_days < 0:
         raise ValueError("MCP_TASK_RETENTION_DAYS must not be negative")
     if not CONFIG.tasks_root.is_dir():
@@ -263,56 +495,49 @@ def _prune_old_workspace_tasks() -> int:
 
     cutoff = datetime.now(UTC) - timedelta(days=CONFIG.task_retention_days)
     removed = 0
-    with _workspace_write_lock:
-        for task_dir in CONFIG.tasks_root.iterdir():
-            if (
-                not re.fullmatch(r"task_[0-9a-f]{32}", task_dir.name)
-                or task_dir.is_symlink()
-                or not task_dir.is_dir()
-            ):
+    for task_dir in list(CONFIG.tasks_root.iterdir()):
+        if (
+            not re.fullmatch(r"task_[0-9a-f]{32}", task_dir.name)
+            or task_dir.is_symlink()
+            or not task_dir.is_dir()
+        ):
+            continue
+        status_path = task_dir / "status.json"
+        if not status_path.is_file():
+            continue
+        try:
+            status = _read_task_json(status_path)
+            if status.get("status") in {"queued", "running"}:
+                status = _recover_workspace_task(task_dir, task_dir.name)
+            if status.get("status") not in _TERMINAL_TASK_STATES:
                 continue
-            status_path = task_dir / "status.json"
-            try:
-                status = json.loads(status_path.read_text(encoding="utf-8"))
-                if status.get("status") not in {"succeeded", "failed", "timed_out", "cancelled"}:
-                    continue
-                timestamp = status.get("finished_at") or status.get("created_at")
-                if not isinstance(timestamp, str):
-                    continue
-                last_activity = datetime.fromisoformat(timestamp)
-                if last_activity.tzinfo is None:
-                    last_activity = last_activity.replace(tzinfo=UTC)
-                if last_activity.astimezone(UTC) >= cutoff:
-                    continue
+            timestamp = status.get("finished_at") or status.get("created_at")
+            if not isinstance(timestamp, str):
+                continue
+            last_activity = datetime.fromisoformat(timestamp)
+            if last_activity.tzinfo is None:
+                last_activity = last_activity.replace(tzinfo=UTC)
+            if last_activity.astimezone(UTC) >= cutoff:
+                continue
+            with _workspace_write_lock:
                 shutil.rmtree(task_dir)
-                removed += 1
-            except (OSError, ValueError, json.JSONDecodeError):
-                continue
+            removed += 1
+        except (OSError, ValueError, RuntimeError, json.JSONDecodeError):
+            continue
     return removed
 
 
-def _write_task_json(path: Path, payload: dict[str, Any]) -> None:
-    _write_text_atomic(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-
-
-def _worker_is_alive(pid: Any, task_id: str) -> bool:
-    if not isinstance(pid, int) or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except (OSError, ValueError):
-        return False
-    try:
-        result = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "command="],
-            text=True,
-            capture_output=True,
-            timeout=2,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return True
-    return result.returncode == 0 and "workspace_task_runner.py" in result.stdout and task_id in result.stdout
+def _reserve_workspace_task_dir() -> tuple[str, Path]:
+    _prune_old_workspace_tasks()
+    CONFIG.tasks_root.mkdir(parents=True, exist_ok=True)
+    while True:
+        task_id = f"task_{uuid.uuid4().hex}"
+        task_dir = _task_dir(task_id)
+        try:
+            task_dir.mkdir(parents=False, exist_ok=False)
+            return task_id, task_dir
+        except FileExistsError:
+            continue
 
 
 def _start_workspace_task(
@@ -321,13 +546,24 @@ def _start_workspace_task(
     working_dir: Path,
     cwd_relative: str,
     timeout_seconds: int,
+    *,
+    task_id: str | None = None,
+    task_dir: Path | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    _prune_old_workspace_tasks()
-    task_id = f"task_{uuid.uuid4().hex}"
-    task_dir = _task_dir(task_id)
-    task_dir.mkdir(parents=True, exist_ok=False)
+    if (task_id is None) != (task_dir is None):
+        raise ValueError("task_id and task_dir must be supplied together")
+    if task_id is None or task_dir is None:
+        task_id, task_dir = _reserve_workspace_task_dir()
+    else:
+        expected_dir = _task_dir(task_id)
+        if task_dir.resolve() != expected_dir or not task_dir.is_dir():
+            raise ValueError("reserved task directory does not match task_id")
+
     request_path = task_dir / "request.json"
     status_path = task_dir / "status.json"
+    created_at = _utc_now()
+    metadata = dict(metadata or {})
     request = {
         "task_id": task_id,
         "language": language,
@@ -336,7 +572,9 @@ def _start_workspace_task(
         "cwd_relative": cwd_relative,
         "timeout_seconds": timeout_seconds,
         "execution_home": CONFIG.execution_home or None,
-        "created_at": _utc_now(),
+        "log_limit_bytes": CONFIG.max_background_log_bytes,
+        "created_at": created_at,
+        "metadata": metadata,
     }
     status: dict[str, Any] = {
         "task_id": task_id,
@@ -344,37 +582,53 @@ def _start_workspace_task(
         "language": language,
         "cwd": cwd_relative,
         "timeout_seconds": timeout_seconds,
-        "created_at": request["created_at"],
+        "created_at": created_at,
         "started_at": None,
         "finished_at": None,
         "worker_pid": None,
+        "worker_start_time": None,
         "pid": None,
+        "pid_start_time": None,
+        "pgid": None,
         "exit_code": None,
         "error": None,
+        "stdout_truncated": False,
+        "stderr_truncated": False,
+        **metadata,
     }
-    _write_task_json(request_path, request)
-    _write_task_json(status_path, status)
-
     runner = CONFIG.project_root / "scripts" / "workspace_task_runner.py"
-    if not runner.is_file():
-        status.update(status="failed", finished_at=_utc_now(), error="task runner is unavailable")
+    _write_task_json(request_path, request)
+    with _task_state_lock(task_dir):
         _write_task_json(status_path, status)
-        raise RuntimeError(f"task runner is unavailable: {runner}")
-    try:
-        subprocess.Popen(
-            [sys.executable, str(runner), str(request_path)],
-            cwd=CONFIG.project_root,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            env=_execution_environment(),
-            start_new_session=True,
-            close_fds=True,
+        if not runner.is_file():
+            status.update(status="failed", finished_at=_utc_now(), error="task runner is unavailable")
+            _write_task_json(status_path, status)
+            raise RuntimeError(f"task runner is unavailable: {runner}")
+        try:
+            runner_process = subprocess.Popen(
+                [sys.executable, str(runner), str(request_path)],
+                cwd=CONFIG.project_root,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=_execution_environment(),
+                start_new_session=True,
+                close_fds=True,
+            )
+        except OSError as error:
+            status.update(status="failed", finished_at=_utc_now(), error=str(error))
+            _write_task_json(status_path, status)
+            raise RuntimeError(f"could not start background task: {error}") from error
+
+        # Publish queued state and reliable runner identity atomically with
+        # respect to recovery/pruning. The runner blocks on this same lock until
+        # the identity record is durable.
+        runner_snapshot = _proc_snapshot(runner_process.pid)
+        status["worker_pid"] = runner_process.pid
+        status["worker_start_time"] = (
+            runner_snapshot["start_time"] if runner_snapshot is not None else None
         )
-    except OSError as error:
-        status.update(status="failed", finished_at=_utc_now(), error=str(error))
         _write_task_json(status_path, status)
-        raise RuntimeError(f"could not start background task: {error}") from error
 
     relative_task_dir = task_dir.relative_to(CONFIG.workspace_root).as_posix()
     return {
@@ -384,7 +638,6 @@ def _start_workspace_task(
         "stdout_path": f"{relative_task_dir}/stdout.log",
         "stderr_path": f"{relative_task_dir}/stderr.log",
     }
-
 
 def _run_checked(command: list[str], cwd: Path) -> str:
     try:
@@ -432,7 +685,11 @@ def _draft_file(relative_path: str, *, must_exist: bool = True) -> tuple[Path, s
     if not relative_path or candidate.is_absolute():
         raise ValueError("path must be relative to draft")
     resolved = (CONFIG.draft_root / candidate).resolve()
-    if CONFIG.draft_root not in resolved.parents or (must_exist and not resolved.is_file()):
+    if CONFIG.draft_root not in resolved.parents:
+        raise ValueError("path is not a file inside draft")
+    if resolved.exists() and not resolved.is_file():
+        raise ValueError("path is not a file inside draft")
+    if must_exist and not resolved.is_file():
         raise ValueError("path is not a file inside draft")
     return resolved, resolved.relative_to(CONFIG.draft_root).as_posix()
 
@@ -470,6 +727,7 @@ def _git_commits_for_file(relative_path: str) -> list[dict[str, str]]:
     output = _run_checked(
         [
             "git",
+            "--literal-pathspecs",
             "log",
             "--follow",
             f"--max-count={CONFIG.draft_history_limit + 1}",
@@ -495,7 +753,7 @@ def _git_diff_for_file(relative_path: str, revision: str = "HEAD") -> str:
     resolved, normalized = _draft_file(relative_path, must_exist=False)
     revision = _validated_revision(revision)
     tracked = subprocess.run(
-        ["git", "ls-files", "--error-unmatch", "--", normalized],
+        ["git", "--literal-pathspecs", "ls-files", "--error-unmatch", "--", normalized],
         cwd=CONFIG.draft_root,
         text=True,
         capture_output=True,
@@ -509,7 +767,7 @@ def _git_diff_for_file(relative_path: str, revision: str = "HEAD") -> str:
         f"--word-diff-regex={CONFIG.git_word_diff_regex}",
     ]
     command = (
-        ["git", "diff", "--no-ext-diff", "--no-color", *word_diff_args, revision, "--", normalized]
+        ["git", "--literal-pathspecs", "diff", "--no-ext-diff", "--no-color", *word_diff_args, revision, "--", normalized]
         if tracked
         else [
             "git",
@@ -577,12 +835,11 @@ def load_skill(name: str) -> str:
 
 @mcp.tool()
 def read_workspace_file(path: str) -> dict[str, Any]:
-    """Read a UTF-8 text file using a path relative to the shared workspace."""
-    resolved, content = _read_workspace_text(path)
-    truncated = len(content) > CONFIG.max_read_chars
+    """Read a bounded UTF-8 prefix of one workspace file."""
+    resolved, content, truncated = _read_workspace_prefix(path)
     return {
         "path": path,
-        "content": content[: CONFIG.max_read_chars],
+        "content": content,
         "truncated": truncated,
         "size_bytes": resolved.stat().st_size,
         "sha256": _file_sha256(resolved),
@@ -597,16 +854,10 @@ def read_workspace_range(
     anchor: str | None = None,
     context_lines: int = 20,
 ) -> dict[str, Any]:
-    """Read an inclusive line range or context surrounding one exact anchor.
-
-    Paths are relative to the workspace. For line mode, provide both start_line
-    and end_line using 1-based inclusive line numbers. For anchor mode, provide
-    only anchor; it must occur exactly once, and context_lines lines are returned
-    before and after it. The returned start_line/end_line identify the excerpt.
-    """
-    resolved, content = _read_workspace_text(path)
-    lines = content.splitlines(keepends=True)
-    total_lines = len(lines)
+    """Read a bounded line range or exact-anchor context without unbounded memory."""
+    resolved = _workspace_path(path, must_exist=True)
+    if not resolved.is_file():
+        raise ValueError("path is not a file")
 
     if anchor is not None:
         if start_line is not None or end_line is not None:
@@ -615,6 +866,15 @@ def read_workspace_range(
             raise ValueError("anchor must not be empty")
         if context_lines < 0:
             raise ValueError("context_lines must be non-negative")
+        size_bytes = resolved.stat().st_size
+        if size_bytes > CONFIG.max_anchor_scan_bytes:
+            raise ValueError(
+                "anchor mode is disabled for very large files; use an explicit line range "
+                "or run_workspace_code for targeted large-file inspection"
+            )
+        content = resolved.read_text(encoding="utf-8")
+        lines = content.splitlines(keepends=True)
+        total_lines = len(lines)
         actual_count = content.count(anchor)
         if actual_count != 1:
             raise ValueError(f"anchor matched {actual_count} times; expected exactly 1")
@@ -624,27 +884,29 @@ def read_workspace_range(
         anchor_end_line = content.count("\n", 0, max(match_start, match_end - 1)) + 1
         selected_start = max(1, anchor_start_line - context_lines)
         selected_end = min(total_lines, anchor_end_line + context_lines)
+        excerpt = "".join(lines[selected_start - 1 : selected_end])
+        truncated = len(excerpt) > CONFIG.max_read_chars
+        excerpt = excerpt[: CONFIG.max_read_chars]
         mode = "anchor"
     else:
         if start_line is None or end_line is None:
             raise ValueError("provide anchor or both start_line and end_line")
         if start_line < 1 or end_line < start_line:
             raise ValueError("line range must be 1-based with end_line >= start_line")
-        if end_line > total_lines:
-            raise ValueError(f"end_line exceeds file length of {total_lines} lines")
+        excerpt, truncated, total_lines = _read_line_range_bounded(
+            resolved, start_line, end_line
+        )
         selected_start = start_line
         selected_end = end_line
         mode = "lines"
 
-    excerpt = "".join(lines[selected_start - 1 : selected_end])
-    truncated = len(excerpt) > CONFIG.max_read_chars
     return {
         "path": path,
         "mode": mode,
         "start_line": selected_start,
         "end_line": selected_end,
         "total_lines": total_lines,
-        "content": excerpt[: CONFIG.max_read_chars],
+        "content": excerpt,
         "truncated": truncated,
         "sha256": _file_sha256(resolved),
     }
@@ -1031,53 +1293,54 @@ def apply_workspace_patch(patch: str) -> dict[str, Any]:
 def spawn_chatgpt_subagent(task: str) -> dict[str, Any]:
     """Asynchronously delegate one complete task to a new ChatGPT Web conversation.
 
-    Pass the complete delegated task directly. This tool allocates an isolated
-    workspace/temp/<uid>/ input/output pair, writes the task, and sends a fixed browser
-    prompt containing only those paths. It reuses the standard background task system
-    and returns a task_id immediately. input_path stores the delegated task; output_path
-    is the sub-agent's authoritative result, while stdout_path and stderr_path contain
-    execution logs. Poll get_workspace_task; succeeded means output_path changed and
-    ends with the completion sentinel. Use get_workspace_task's default server-side
-    wait while the task is active; after failure or timeout, read the returned log
-    paths with the workspace file tools. The output wait defaults to one hour.
+    The delegated input, authoritative output, execution logs, and lifecycle state
+    all live under the returned task_dir. output.md is absent while queued, created
+    by the child with a fixed started marker, and atomically replaced by the final
+    result plus a fixed completion marker.
     """
     if not CONFIG.chatgpt_automation_enabled:
         raise RuntimeError(
             "ChatGPT browser automation is disabled; set "
             "MCP_CHATGPT_AUTOMATION_ENABLED=true for the local MCP process"
         )
-
     if not task.strip():
         raise ValueError("task must not be empty")
     if len(task) > CONFIG.max_read_chars:
         raise ValueError(f"task exceeds the {CONFIG.max_read_chars} character limit")
 
-    allocation = _allocate_subagent_files(task)
-    normalized_input = allocation["input_path"]
-    normalized_output = allocation["output_path"]
-    _render_chatgpt_subagent_prompt(normalized_input, normalized_output)
-    task_timeout = (
-        CONFIG.chatgpt_completion_timeout_seconds
-        + CONFIG.chatgpt_browser_timeout_seconds
-        + 30
-    )
-    if task_timeout > CONFIG.max_background_timeout_seconds:
-        raise ValueError(
-            "ChatGPT completion plus browser timeout exceeds "
-            "MCP_MAX_BACKGROUND_TIMEOUT"
-        )
+    task_id, task_dir = _reserve_workspace_task_dir()
+    relative_task_dir = task_dir.relative_to(CONFIG.workspace_root).as_posix()
+    normalized_input = f"{relative_task_dir}/input.md"
+    normalized_output = f"{relative_task_dir}/output.md"
+    try:
+        _write_text_atomic(task_dir / "input.md", task)
+        _render_chatgpt_subagent_prompt(normalized_input, normalized_output)
+    except BaseException:
+        shutil.rmtree(task_dir, ignore_errors=True)
+        raise
+
+    # The delegated runner owns the authoritative one-hour post-send completion
+    # timeout. Give the outer background supervisor the full configured maximum so
+    # browser-profile queueing/setup cannot consume that completion budget.
     result = _start_workspace_task(
         "python",
         _chatgpt_subagent_task_code(normalized_input, normalized_output),
         CONFIG.workspace_root,
         ".",
-        task_timeout,
+        CONFIG.max_background_timeout_seconds,
+        task_id=task_id,
+        task_dir=task_dir,
+        metadata={
+            "kind": "chatgpt_subagent",
+            "input_path": normalized_input,
+            "output_path": normalized_output,
+        },
     )
     return {
         **result,
         "input_path": normalized_input,
         "output_path": normalized_output,
-        "completion": "output file update plus final sentinel",
+        "completion": "task-owned output file with started and completed sentinels",
         "message": "Sub-agent queued; poll get_workspace_task with task_id.",
     }
 
@@ -1110,8 +1373,125 @@ def restart_mcp_server() -> dict[str, Any]:
     }
 
 
+class _BoundedBytesCapture:
+    def __init__(self, limit_bytes: int) -> None:
+        self.limit = max(1024, int(limit_bytes))
+        marker = b"\n... output truncated; middle omitted ...\n"
+        payload = max(0, self.limit - len(marker))
+        self.head_limit = payload // 2
+        self.tail_limit = payload - self.head_limit
+        self.marker = marker
+        self.head = bytearray()
+        self.tail = bytearray()
+        self.total = 0
+
+    def consume(self, data: bytes) -> None:
+        if not data:
+            return
+        self.total += len(data)
+        offset = 0
+        if len(self.head) < self.head_limit:
+            take = min(len(data), self.head_limit - len(self.head))
+            self.head.extend(data[:take])
+            offset = take
+        if offset < len(data):
+            self.tail.extend(data[offset:])
+            if len(self.tail) > self.tail_limit:
+                del self.tail[: len(self.tail) - self.tail_limit]
+
+    @property
+    def truncated(self) -> bool:
+        return self.total > self.head_limit + self.tail_limit
+
+    def value(self) -> bytes:
+        if self.truncated:
+            return bytes(self.head) + self.marker + bytes(self.tail)
+        return bytes(self.head) + bytes(self.tail)
+
+
+def _drain_capture_pipe(stream: Any, capture: _BoundedBytesCapture) -> None:
+    try:
+        while True:
+            chunk = stream.read(64 * 1024)
+            if not chunk:
+                return
+            capture.consume(chunk)
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
+def _run_foreground_command(
+    language: Literal["python", "shell"],
+    code: str,
+    working_dir: Path,
+    timeout: int,
+) -> dict[str, Any]:
+    command = ["python", "-c", code] if language == "python" else ["/bin/sh", "-c", code]
+    process = subprocess.Popen(
+        command,
+        cwd=working_dir,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=_execution_environment(),
+        start_new_session=True,
+        close_fds=True,
+    )
+    stdout_capture = _BoundedBytesCapture(CONFIG.max_foreground_capture_bytes)
+    stderr_capture = _BoundedBytesCapture(CONFIG.max_foreground_capture_bytes)
+    assert process.stdout is not None and process.stderr is not None
+    threads = [
+        threading.Thread(
+            target=_drain_capture_pipe, args=(process.stdout, stdout_capture), daemon=True
+        ),
+        threading.Thread(
+            target=_drain_capture_pipe, args=(process.stderr, stderr_capture), daemon=True
+        ),
+    ]
+    for thread in threads:
+        thread.start()
+
+    timed_out = False
+    try:
+        process.wait(timeout=timeout)
+        if os.name == "posix" and _process_group_members(process.pid):
+            _stop_process_group(process)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _stop_process_group(process)
+    finally:
+        try:
+            process.wait(timeout=1)
+        except (subprocess.TimeoutExpired, ChildProcessError):
+            pass
+        for thread in threads:
+            thread.join(timeout=10)
+
+    stdout_text = stdout_capture.value().decode("utf-8", errors="replace")
+    stderr_text = stderr_capture.value().decode("utf-8", errors="replace")
+    stdout_value, stdout_chars_truncated = _truncate(stdout_text)
+    stderr_value, stderr_chars_truncated = _truncate(stderr_text)
+    result = {
+        "exit_code": process.returncode,
+        "stdout": stdout_value,
+        "stderr": stderr_value,
+        "truncated": (
+            stdout_capture.truncated
+            or stderr_capture.truncated
+            or stdout_chars_truncated
+            or stderr_chars_truncated
+        ),
+    }
+    if timed_out:
+        result["timed_out"] = True
+    return result
+
+
 @mcp.tool()
-def run_workspace_code(
+async def run_workspace_code(
     language: Literal["python", "shell"],
     code: str,
     cwd: str = ".",
@@ -1120,11 +1500,8 @@ def run_workspace_code(
 ) -> dict[str, Any]:
     """Run Python or POSIX shell code inside the container and shared workspace.
 
-    The working directory must stay inside the workspace. Use this for flexible
-    document processing when the dedicated file tools are insufficient. Set
-    background=true for long-running work; the call returns immediately with a
-    task_id that can be passed to get_workspace_task. Background execution defaults
-    to a one-hour timeout unless timeout_seconds is provided.
+    Foreground subprocess waiting is offloaded so unrelated MCP requests remain
+    responsive. Set background=true for persistent task execution.
     """
     working_dir = _workspace_path(cwd, must_exist=True)
     if not working_dir.is_dir():
@@ -1147,56 +1524,17 @@ def run_workspace_code(
     timeout = timeout_seconds if timeout_seconds is not None else CONFIG.default_timeout_seconds
     if not 1 <= timeout <= CONFIG.max_timeout_seconds:
         raise ValueError(f"timeout_seconds must be between 1 and {CONFIG.max_timeout_seconds}")
-
-    command = ["python", "-c", code] if language == "python" else ["/bin/sh", "-c", code]
-    process = subprocess.Popen(
-        command,
-        cwd=working_dir,
-        text=True,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=_execution_environment(),
-        start_new_session=True,
-        close_fds=True,
+    return await asyncio.to_thread(
+        _run_foreground_command, language, code, working_dir, timeout
     )
-    try:
-        stdout, stderr = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _stop_process_group(process)
-        stdout, stderr = process.communicate()
-        stdout_value, stdout_truncated = _truncate(stdout or "")
-        stderr_value, stderr_truncated = _truncate(stderr or "")
-        return {
-            "exit_code": process.returncode,
-            "stdout": stdout_value,
-            "stderr": stderr_value,
-            "truncated": stdout_truncated or stderr_truncated,
-            "timed_out": True,
-        }
-
-    stdout_value, stdout_truncated = _truncate(stdout or "")
-    stderr_value, stderr_truncated = _truncate(stderr or "")
-    return {
-        "exit_code": process.returncode,
-        "stdout": stdout_value,
-        "stderr": stderr_value,
-        "truncated": stdout_truncated or stderr_truncated,
-    }
 
 
 @mcp.tool()
-def cancel_workspace_task(
+async def cancel_workspace_task(
     task_id: str,
     wait_seconds: int = 5,
 ) -> dict[str, Any]:
-    """Request cancellation of a queued or running background task.
-
-    The detached worker observes a persisted cancellation marker and terminates the
-    command's process group, so spawned descendants are stopped as well. This call
-    waits briefly for the task to reach a terminal state; use get_workspace_task if
-    it is still queued or running when the wait expires.
-    """
+    """Request cancellation of a queued or running background task."""
     if not 0 <= wait_seconds <= CONFIG.task_max_wait_seconds:
         raise ValueError(
             f"wait_seconds must be between 0 and {CONFIG.task_max_wait_seconds}"
@@ -1205,33 +1543,18 @@ def cancel_workspace_task(
     status_path = task_dir / "status.json"
     if not status_path.is_file():
         raise FileNotFoundError(f"unknown task: {task_id}")
-    try:
-        status = json.loads(status_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise RuntimeError(f"could not read task status: {error}") from error
-
+    status = _read_task_json(status_path)
     if status.get("status") in {"queued", "running"}:
         _write_text_atomic(task_dir / "cancel.requested", f"{_utc_now()}\n")
-    return get_workspace_task(task_id, wait_seconds=wait_seconds)
+    return await get_workspace_task(task_id, wait_seconds=wait_seconds)
 
 
 @mcp.tool()
-def get_workspace_task(
+async def get_workspace_task(
     task_id: str,
     wait_seconds: int = CONFIG.task_default_wait_seconds,
 ) -> dict[str, Any]:
-    """Wait briefly for a background task and return its status.
-
-    task_id comes from run_workspace_code(background=true) or
-    spawn_chatgpt_subagent. Status is one of queued, running, succeeded, failed,
-    timed_out, or cancelled. For a ChatGPT sub-agent, succeeded means its output file was
-    updated and ends with the required sentinel. By default, this call waits
-    server-side for up to 30 seconds and returns sooner when the task reaches a
-    terminal state, reducing repeated tool calls. Set wait_seconds=0 for an immediate
-    check. This tool returns log paths, not log contents; after failure or timeout,
-    read stderr_path or stdout_path with read_workspace_file/read_workspace_range.
-    Task status and logs persist on disk rather than only in MCP memory.
-    """
+    """Wait without blocking unrelated MCP requests and return task status."""
     if not 0 <= wait_seconds <= CONFIG.task_max_wait_seconds:
         raise ValueError(
             f"wait_seconds must be between 0 and {CONFIG.task_max_wait_seconds}"
@@ -1243,27 +1566,13 @@ def get_workspace_task(
 
     deadline = time.monotonic() + wait_seconds
     while True:
-        try:
-            status = json.loads(status_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
-            raise RuntimeError(f"could not read task status: {error}") from error
-
-        if status.get("status") == "running" and not _worker_is_alive(
-            status.get("worker_pid"), task_id
-        ):
-            status.update(
-                status="failed",
-                finished_at=_utc_now(),
-                error="background worker is no longer running",
-            )
-            _write_task_json(status_path, status)
-
+        status = await asyncio.to_thread(_recover_workspace_task, task_dir, task_id)
         if status.get("status") not in {"queued", "running"}:
             break
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
-        time.sleep(min(1.0, remaining))
+        await asyncio.sleep(min(0.5, remaining))
 
     relative_task_dir = task_dir.relative_to(CONFIG.workspace_root).as_posix()
     return {
@@ -1302,7 +1611,7 @@ async def draft_diff_content(request: Request) -> Response:
         resolved, normalized = _draft_file(relative_path, must_exist=False)
         if not resolved.exists():
             tracked = subprocess.run(
-                ["git", "ls-files", "--error-unmatch", "--", normalized],
+                ["git", "--literal-pathspecs", "ls-files", "--error-unmatch", "--", normalized],
                 cwd=CONFIG.draft_root,
                 text=True,
                 capture_output=True,
@@ -1349,9 +1658,9 @@ async def draft_diff_commit(request: Request) -> Response:
         if "\n" in message or "\r" in message or len(message) > 200:
             return JSONResponse({"error": "提交说明必须是 1–200 个字符的单行文本"}, status_code=400)
 
-        _run_checked(["git", "add", "--", relative_path], CONFIG.draft_root)
+        _run_checked(["git", "--literal-pathspecs", "add", "--", relative_path], CONFIG.draft_root)
         result = _run_checked(
-            ["git", "commit", "-m", message, "--", relative_path],
+            ["git", "--literal-pathspecs", "commit", "-m", message, "--", relative_path],
             CONFIG.draft_root,
         )
         commit_hash = _run_checked(["git", "rev-parse", "--short", "HEAD"], CONFIG.draft_root).strip()
@@ -1376,7 +1685,7 @@ async def draft_diff_revert(request: Request) -> Response:
                 return JSONResponse({"error": "这个文件没有可撤销的 diff"}, status_code=409)
 
             tracked = subprocess.run(
-                ["git", "ls-files", "--error-unmatch", "--", relative_path],
+                ["git", "--literal-pathspecs", "ls-files", "--error-unmatch", "--", relative_path],
                 cwd=CONFIG.draft_root,
                 text=True,
                 capture_output=True,
@@ -1387,6 +1696,7 @@ async def draft_diff_revert(request: Request) -> Response:
                 _run_checked(
                     [
                         "git",
+                        "--literal-pathspecs",
                         "restore",
                         "--source=HEAD",
                         "--staged",
@@ -1417,6 +1727,7 @@ def skill_resource(name: str) -> str:
 if __name__ == "__main__":
     CONFIG.workspace_root.mkdir(parents=True, exist_ok=True)
     CONFIG.tasks_root.mkdir(parents=True, exist_ok=True)
+    _prune_old_workspace_tasks()
     if CONFIG.execution_home:
         Path(CONFIG.execution_home).mkdir(parents=True, exist_ok=True)
     mcp.run(transport="streamable-http")

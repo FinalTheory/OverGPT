@@ -13,7 +13,7 @@ import sys
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from time import monotonic, sleep
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 sys.dont_write_bytecode = True
 from urllib.parse import urlparse
@@ -32,6 +32,24 @@ SEND_BUTTON_SELECTORS = (
 IGNORED_CHROME_DEFAULT_ARGS = ("--use-mock-keychain",)
 DEBUG_UI_HOLD_FILE = Path("/tmp/mymcp-debug-ui/hold-browser-open")
 DEBUG_UI_HOLD_SECONDS = 60
+SUBAGENT_STARTED_SENTINEL = "WRITERSUBAGENTSTARTED4C81E2B5"
+SUBAGENT_COMPLETED_SENTINEL = "WRITERSUBAGENTCOMPLETE7D3A9F6C"
+SUBAGENT_START_TIMEOUT_SECONDS = 300
+BROWSER_TASK_CONCURRENCY = 10
+TASK_PROFILES_ROOT = Path(__file__).resolve().parent / "chatgpt-task-profiles"
+
+
+class ChatGPTPreSendError(RuntimeError):
+    """Known-unsent browser failure that may be retried safely."""
+
+
+class ChatGPTRateLimitError(RuntimeError):
+    """Platform rate-limit UI blocked a known-unsent prompt."""
+
+
+class ChatGPTPostSendError(RuntimeError):
+    """Failure after Send that must never trigger another submission."""
+
 
 
 @contextmanager
@@ -47,30 +65,84 @@ def _browser_profile_lock(profile_dir: Path) -> Iterator[None]:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+def _clone_browser_profile(source: Path, destination: Path) -> None:
+    """Copy authenticated profile state without volatile browser caches."""
+    destination.mkdir(parents=True, exist_ok=False, mode=0o700)
+    for filename in ("Local State", "first_party_sets.db"):
+        candidate = source / filename
+        if candidate.is_file():
+            shutil.copy2(candidate, destination / filename)
+
+    ignored_profile_entries = {
+        "Cache",
+        "Code Cache",
+        "GPUCache",
+        "DawnGraphiteCache",
+        "DawnWebGPUCache",
+        "GrShaderCache",
+        "ShaderCache",
+    }
+
+    def ignore_profile_cache(_directory: str, names: list[str]) -> set[str]:
+        return set(names) & ignored_profile_entries
+
+    for candidate in source.iterdir():
+        if not candidate.is_dir() or not (candidate / "Preferences").is_file():
+            continue
+        shutil.copytree(
+            candidate,
+            destination / candidate.name,
+            ignore=ignore_profile_cache,
+        )
+
+
+@contextmanager
+def _browser_task_profile(source: Path) -> Iterator[Path]:
+    """Lease one of ten bounded repo-local profile slots."""
+    TASK_PROFILES_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    while True:
+        for index in range(BROWSER_TASK_CONCURRENCY):
+            slot_dir = TASK_PROFILES_ROOT / f"slot_{index:02d}"
+            slot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            lock_handle = (slot_dir / ".lock").open("a+b")
+            try:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                lock_handle.close()
+                continue
+
+            profile_dir = slot_dir / "profile"
+            try:
+                if profile_dir.exists():
+                    shutil.rmtree(profile_dir)
+                with _browser_profile_lock(source):
+                    _clone_browser_profile(source, profile_dir)
+                yield profile_dir
+            finally:
+                if profile_dir.exists():
+                    shutil.rmtree(profile_dir)
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+                lock_handle.close()
+            return
+        sleep(0.2)
+
+
 def render_subagent_prompt(
     template_file: Path,
     input_path: str,
     output_path: str,
-    completion_sentinel: str,
 ) -> str:
-    """Replace paths and the fixed completion marker in the prompt template."""
+    """Replace task paths and fixed lifecycle markers in the prompt template."""
     if not template_file.is_file():
         raise FileNotFoundError(
             f"ChatGPT sub-agent prompt is unavailable: {template_file}"
         )
     template = template_file.read_text(encoding="utf-8")
-    if (
-        not completion_sentinel
-        or "\n" in completion_sentinel
-        or "\r" in completion_sentinel
-    ):
-        raise ValueError(
-            "completion sentinel must be non-empty and contain no newlines"
-        )
     placeholders = {
         "{{INPUT_PATH}}": json.dumps(input_path, ensure_ascii=False),
         "{{OUTPUT_PATH}}": json.dumps(output_path, ensure_ascii=False),
-        "{{COMPLETION_SENTINEL}}": completion_sentinel,
+        "{{STARTED_SENTINEL}}": SUBAGENT_STARTED_SENTINEL,
+        "{{COMPLETION_SENTINEL}}": SUBAGENT_COMPLETED_SENTINEL,
     }
     for placeholder, value in placeholders.items():
         actual_count = template.count(placeholder)
@@ -96,27 +168,27 @@ def normalize_workspace_relative_path(relative_path: str) -> str:
 
 
 def validate_subagent_path_pair(
-    input_path: str, output_path: str, temp_dirname: str
+    input_path: str, output_path: str, tasks_dirname: str
 ) -> str:
-    """Validate the lexical shape of one allocator-issued path pair."""
-    temp_parts = PurePosixPath(temp_dirname).parts
+    """Validate one task-owned .mcp-tasks/task_<uid>/input-output pair."""
+    task_parts = PurePosixPath(tasks_dirname).parts
     input_parts = PurePosixPath(input_path).parts
     output_parts = PurePosixPath(output_path).parts
-    prefix_length = len(temp_parts)
+    prefix_length = len(task_parts)
     expected_length = prefix_length + 2
     if (
-        input_parts[:prefix_length] != temp_parts
-        or output_parts[:prefix_length] != temp_parts
+        input_parts[:prefix_length] != task_parts
+        or output_parts[:prefix_length] != task_parts
         or len(input_parts) != expected_length
         or len(output_parts) != expected_length
         or input_parts[-1] != "input.md"
         or output_parts[-1] != "output.md"
         or input_parts[-2] != output_parts[-2]
-        or not re.fullmatch(r"[0-9a-f]{32}", input_parts[-2])
+        or not re.fullmatch(r"task_[0-9a-f]{32}", input_parts[-2])
     ):
         raise ValueError(
-            "paths must be one internally allocated temp/<uid>/input.md and "
-            "output.md pair"
+            "paths must be one internally allocated .mcp-tasks/task_<uid>/"
+            "input.md and output.md pair"
         )
     return input_parts[-2]
 
@@ -155,6 +227,14 @@ def _find_composer(page: Any, timeout_ms: int) -> Any:
     return _visible_locator(page, COMPOSER_SELECTORS, timeout_ms)
 
 
+def _rate_limit_modal_visible(page: Any) -> bool:
+    try:
+        modal = page.locator('[data-testid="modal-conversation-history-rate-limit"]')
+        return modal.count() > 0 and modal.first.is_visible()
+    except Exception:
+        return False
+
+
 def _click_verified_send_button(
     page: Any, markers: tuple[str, ...], timeout_ms: int
 ) -> bool:
@@ -168,6 +248,10 @@ def _click_verified_send_button(
             text = composer.inner_text()
             if any(marker not in text for marker in markers):
                 return False
+            if _rate_limit_modal_visible(page):
+                raise ChatGPTRateLimitError(
+                    "ChatGPT rate-limit modal blocked Send before submission"
+                )
             button.click()
             return True
         page.wait_for_timeout(150)
@@ -199,7 +283,7 @@ def _fill_verified_prompt(
         missing = [marker for marker in markers if marker not in text]
         if not missing:
             return
-    raise RuntimeError(
+    raise ChatGPTPreSendError(
         "ChatGPT composer lost the delegated prompt before sending; "
         f"missing markers: {missing}"
     )
@@ -265,8 +349,9 @@ def send_prompt(
     headless: bool,
     timeout_seconds: int,
     verification_markers: tuple[str, ...],
+    started_wait: Callable[[], float] | None = None,
 ) -> dict[str, Any]:
-    """Fill and send one verified prompt, then release the browser profile."""
+    """Send one verified prompt with bounded retries only before Send."""
     if not prompt.strip():
         raise ValueError("prompt must not be empty")
     if not _is_temporary_chat_url(url):
@@ -275,6 +360,7 @@ def send_prompt(
         raise ValueError("timeout_seconds must be positive")
     if not verification_markers or any(not marker for marker in verification_markers):
         raise ValueError("verification_markers must contain non-empty values")
+
     try:
         from playwright.sync_api import Error as PlaywrightError
         from playwright.sync_api import sync_playwright
@@ -291,46 +377,105 @@ def send_prompt(
         pass
 
     timeout_ms = timeout_seconds * 1000
-    with _browser_profile_lock(profile_dir):
-        try:
-            with sync_playwright() as playwright:
-                options: dict[str, Any] = {
-                    "user_data_dir": str(profile_dir),
-                    "headless": headless,
-                    "ignore_default_args": list(IGNORED_CHROME_DEFAULT_ARGS),
-                }
-                if browser_channel:
-                    options["channel"] = browser_channel
-                context = playwright.chromium.launch_persistent_context(**options)
-                try:
-                    page = context.pages[0] if context.pages else context.new_page()
-                    page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-                    _fill_verified_prompt(page, prompt, verification_markers, timeout_ms)
-                    if not _is_temporary_chat_url(page.url):
-                        raise RuntimeError("ChatGPT left Temporary Chat before sending")
-                    if not _click_verified_send_button(
-                        page, verification_markers, min(timeout_ms, 10000)
-                    ):
-                        raise RuntimeError(
-                            "ChatGPT prompt changed or its send button was unavailable"
-                        )
-                    result: dict[str, Any] = {
-                        "status": "sent",
-                        "page_url": page.url,
-                        "send_method": "button",
-                    }
-                    if DEBUG_UI_HOLD_FILE.is_file():
-                        result["debug_hold_seconds"] = DEBUG_UI_HOLD_SECONDS
-                        for _ in range(DEBUG_UI_HOLD_SECONDS):
-                            if not DEBUG_UI_HOLD_FILE.is_file():
-                                break
-                            page.wait_for_timeout(1000)
-                finally:
-                    context.close()
-        except PlaywrightError as error:
-            raise RuntimeError(f"Playwright could not automate ChatGPT: {error}") from error
+    attempts = 3
+    last_error: BaseException | None = None
 
-    return result
+    for attempt in range(1, attempts + 1):
+        click_may_have_committed = False
+        try:
+            with _browser_task_profile(profile_dir) as attempt_profile:
+                with sync_playwright() as playwright:
+                    options: dict[str, Any] = {
+                        "user_data_dir": str(attempt_profile),
+                        "headless": headless,
+                        "ignore_default_args": list(IGNORED_CHROME_DEFAULT_ARGS),
+                    }
+                    if browser_channel:
+                        options["channel"] = browser_channel
+                    context = playwright.chromium.launch_persistent_context(**options)
+                    try:
+                        page = context.pages[0] if context.pages else context.new_page()
+                        page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                        _fill_verified_prompt(page, prompt, verification_markers, timeout_ms)
+                        if not _is_temporary_chat_url(page.url):
+                            raise ChatGPTPreSendError(
+                                "ChatGPT left Temporary Chat before sending"
+                            )
+                        if _rate_limit_modal_visible(page):
+                            raise ChatGPTRateLimitError(
+                                "ChatGPT rate-limit modal blocked Send before submission"
+                            )
+
+                        # From this point onward, a browser failure is ambiguous: the
+                        # click may already have reached ChatGPT. Never auto-resend.
+                        click_may_have_committed = True
+                        clicked = _click_verified_send_button(
+                            page, verification_markers, min(timeout_ms, 10000)
+                        )
+                        if not clicked:
+                            click_may_have_committed = False
+                            raise ChatGPTPreSendError(
+                                "ChatGPT prompt changed or its send button was unavailable"
+                            )
+
+                        result: dict[str, Any] = {
+                            "status": "sent",
+                            "page_url": page.url,
+                            "send_method": "button",
+                        }
+                        if started_wait is not None:
+                            try:
+                                result["started_wait_seconds"] = round(
+                                    started_wait(), 3
+                                )
+                            except Exception as error:
+                                raise ChatGPTPostSendError(
+                                    f"sub-agent did not acknowledge start after Send: {error}"
+                                ) from error
+                        if DEBUG_UI_HOLD_FILE.is_file():
+                            result["debug_hold_seconds"] = DEBUG_UI_HOLD_SECONDS
+                            for _ in range(DEBUG_UI_HOLD_SECONDS):
+                                if not DEBUG_UI_HOLD_FILE.is_file():
+                                    break
+                                page.wait_for_timeout(1000)
+                        return result
+                    finally:
+                        try:
+                            context.close()
+                        except PlaywrightError:
+                            if not click_may_have_committed:
+                                raise
+        except (ChatGPTRateLimitError, ChatGPTPostSendError):
+            raise
+        except ChatGPTPreSendError as error:
+            last_error = error
+        except PlaywrightError as error:
+            if click_may_have_committed:
+                return {
+                    "status": "sent_ambiguous",
+                    "page_url": url,
+                    "send_method": "button",
+                    "warning": f"browser failed after Send may have started: {error}",
+                }
+            last_error = ChatGPTPreSendError(
+                f"Playwright could not automate ChatGPT before Send: {error}"
+            )
+        except Exception as error:
+            if click_may_have_committed:
+                return {
+                    "status": "sent_ambiguous",
+                    "page_url": url,
+                    "send_method": "button",
+                    "warning": f"automation failed after Send may have started: {error}",
+                }
+            raise
+
+        if attempt < attempts:
+            sleep(min(2.0, 0.5 * attempt))
+
+    raise RuntimeError(
+        f"ChatGPT pre-send automation failed after {attempts} attempts: {last_error}"
+    ) from last_error
 
 
 def _find_chrome_executable(configured: str) -> Path:
@@ -417,13 +562,12 @@ def send_subagent_task(
     if normalized_input == normalized_output:
         raise ValueError("input_path and output_path must be different files")
     validate_subagent_path_pair(
-        normalized_input, normalized_output, CONFIG.temp_dirname
+        normalized_input, normalized_output, CONFIG.tasks_dirname
     )
     prompt = render_subagent_prompt(
         CONFIG.chatgpt_prompt_file,
         normalized_input,
         normalized_output,
-        CONFIG.chatgpt_completion_sentinel,
     )
 
     output_file: Path | None = None
@@ -447,15 +591,28 @@ def send_subagent_task(
         verification_markers=(
             normalized_input,
             normalized_output,
-            CONFIG.chatgpt_completion_sentinel,
+            SUBAGENT_STARTED_SENTINEL,
+            SUBAGENT_COMPLETED_SENTINEL,
+        ),
+        started_wait=(
+            (
+                lambda: _wait_for_file_completion(
+                    output_file,
+                    output_baseline,
+                    SUBAGENT_START_TIMEOUT_SECONDS,
+                    SUBAGENT_STARTED_SENTINEL,
+                )
+            )
+            if output_file is not None
+            else None
         ),
     )
     if output_file is not None:
         waited = _wait_for_file_completion(
             output_file,
-            output_baseline,
+            None,
             CONFIG.chatgpt_completion_timeout_seconds,
-            CONFIG.chatgpt_completion_sentinel,
+            SUBAGENT_COMPLETED_SENTINEL,
         )
         result.update(
             status="completed",

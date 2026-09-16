@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
@@ -75,6 +76,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    # Debug UI hold is an operator aid and must not slow deterministic tests.
+    chatgpt_playwright.DEBUG_UI_HOLD_FILE = Path("/tmp/mymcp-debug-ui/test-hold-disabled")
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -91,13 +94,15 @@ def main() -> None:
                 headless=True,
                 timeout_seconds=10,
                 verification_markers=("browser marker",),
-            )
-            _wait_for_file_completion(
-                completion_file, None, 10, Handler.completion_sentinel
+                started_wait=lambda: _wait_for_file_completion(
+                    completion_file, None, 10, Handler.completion_sentinel
+                ),
             )
             completion_detected = completion_file.read_text(encoding="utf-8").endswith(
                 Handler.completion_sentinel
             )
+            if "started_wait_seconds" not in result:
+                raise RuntimeError("browser context did not wait for task acknowledgement")
     finally:
         server.shutdown()
         server.server_close()
@@ -107,6 +112,100 @@ def main() -> None:
     if not completion_detected:
         raise RuntimeError(f"completion sentinel was not detected: {result}")
     print("Playwright send and completion-sentinel flow: ok")
+
+    # Transaction-level browser semantics: retry only known pre-send failures and
+    # never retry an ambiguous click.
+    Handler.completion_file = None
+    retry_server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    retry_thread = threading.Thread(target=retry_server.serve_forever, daemon=True)
+    retry_thread.start()
+    try:
+        with tempfile.TemporaryDirectory(prefix="mymcp-browser-txn-") as temp_dir:
+            profile = Path(temp_dir, "profile")
+            original_fill = chatgpt_playwright._fill_verified_prompt
+            fill_calls = 0
+
+            def fail_first_fill(*args: object, **kwargs: object) -> None:
+                nonlocal fill_calls
+                fill_calls += 1
+                if fill_calls == 1:
+                    raise chatgpt_playwright.ChatGPTPreSendError("synthetic pre-send remount")
+                original_fill(*args, **kwargs)
+
+            with patch.object(
+                chatgpt_playwright, "_fill_verified_prompt", side_effect=fail_first_fill
+            ):
+                retried = send_prompt(
+                    "browser marker",
+                    url=f"http://127.0.0.1:{retry_server.server_port}/?temporary-chat=true",
+                    profile_dir=profile,
+                    browser_channel="" if sys.platform == "linux" else "chrome",
+                    headless=True,
+                    timeout_seconds=10,
+                    verification_markers=("browser marker",),
+                )
+            if retried["status"] != "sent" or fill_calls < 2:
+                raise RuntimeError(f"known pre-send failure was not retried: {retried}")
+
+            from playwright.sync_api import Error as PlaywrightError
+
+            click_calls = 0
+
+            def ambiguous_click(*args: object, **kwargs: object) -> bool:
+                nonlocal click_calls
+                click_calls += 1
+                raise PlaywrightError("synthetic click transport loss")
+
+            with patch.object(
+                chatgpt_playwright,
+                "_click_verified_send_button",
+                side_effect=ambiguous_click,
+            ):
+                ambiguous = send_prompt(
+                    "browser marker",
+                    url=f"http://127.0.0.1:{retry_server.server_port}/?temporary-chat=true",
+                    profile_dir=profile,
+                    browser_channel="" if sys.platform == "linux" else "chrome",
+                    headless=True,
+                    timeout_seconds=10,
+                    verification_markers=("browser marker",),
+                )
+            if ambiguous["status"] != "sent_ambiguous" or click_calls != 1:
+                raise RuntimeError(
+                    f"ambiguous Send was retried or misclassified: {ambiguous}, calls={click_calls}"
+                )
+
+            generic_click_calls = 0
+
+            def ambiguous_generic_click(*args: object, **kwargs: object) -> bool:
+                nonlocal generic_click_calls
+                generic_click_calls += 1
+                raise RuntimeError("synthetic post-click automation failure")
+
+            with patch.object(
+                chatgpt_playwright,
+                "_click_verified_send_button",
+                side_effect=ambiguous_generic_click,
+            ):
+                generic_ambiguous = send_prompt(
+                    "browser marker",
+                    url=f"http://127.0.0.1:{retry_server.server_port}/?temporary-chat=true",
+                    profile_dir=profile,
+                    browser_channel="" if sys.platform == "linux" else "chrome",
+                    headless=True,
+                    timeout_seconds=10,
+                    verification_markers=("browser marker",),
+                )
+            if generic_ambiguous["status"] != "sent_ambiguous" or generic_click_calls != 1:
+                raise RuntimeError(
+                    "non-Playwright failure after the Send boundary was retried or "
+                    f"misclassified: {generic_ambiguous}, calls={generic_click_calls}"
+                )
+    finally:
+        retry_server.shutdown()
+        retry_server.server_close()
+        retry_thread.join()
+    print("browser pre-send retry and post-click ambiguity semantics: ok")
 
     with tempfile.TemporaryDirectory(prefix="mymcp-lock-") as temp_dir:
         profile = Path(temp_dir, "profile")
@@ -141,6 +240,36 @@ def main() -> None:
         if first.is_alive() or second.is_alive() or not second_entered.is_set():
             raise RuntimeError("shared browser profile lock did not hand off cleanly")
     print("shared browser profile access is serialized across callers: ok")
+
+    with tempfile.TemporaryDirectory(prefix="mymcp-profile-clone-") as temp_dir:
+        source = Path(temp_dir, "source")
+        destination = Path(temp_dir, "destination")
+        profile = source / "Default"
+        profile.mkdir(parents=True)
+        source.joinpath("Local State").write_text("local-state", encoding="utf-8")
+        profile.joinpath("Preferences").write_text("preferences", encoding="utf-8")
+        profile.joinpath("Cookies").write_text("cookies", encoding="utf-8")
+        cache = profile / "Cache"
+        cache.mkdir()
+        cache.joinpath("large-cache").write_text("cache", encoding="utf-8")
+        chatgpt_playwright._clone_browser_profile(source, destination)
+        if not destination.joinpath("Default", "Cookies").is_file():
+            raise RuntimeError("browser profile clone omitted authenticated profile state")
+        if destination.joinpath("Default", "Cache").exists():
+            raise RuntimeError("browser profile clone copied volatile cache data")
+        with patch.object(
+            chatgpt_playwright,
+            "TASK_PROFILES_ROOT",
+            Path(temp_dir, "task-profiles"),
+        ):
+            with chatgpt_playwright._browser_task_profile(source) as leased_profile:
+                if leased_profile.parent.name != "slot_00":
+                    raise RuntimeError("browser task did not use a bounded profile slot")
+                if not leased_profile.joinpath("Default", "Cookies").is_file():
+                    raise RuntimeError("leased browser profile omitted session state")
+            if leased_profile.exists():
+                raise RuntimeError("leased browser profile was not cleaned up")
+    print("browser tasks receive isolated cache-free profile clones: ok")
 
     with tempfile.TemporaryDirectory(prefix="mymcp-workspace-") as workspace:
         os.environ["MCP_WORKSPACE_ROOT"] = workspace
@@ -203,16 +332,16 @@ def main() -> None:
         if not moved["moved"] or not deleted["deleted"]:
             raise RuntimeError("move/delete workspace file operations failed")
 
-        synchronous_timeout = server.run_workspace_code(
+        synchronous_timeout = asyncio.run(server.run_workspace_code(
             "python",
             (
                 "import subprocess, sys, time; "
-                "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+                "child = subprocess.Popen([sys.executable, '-c', 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)']); "
                 "open('sync-child.pid', 'w').write(str(child.pid)); "
                 "time.sleep(60)"
             ),
             timeout_seconds=1,
-        )
+        ))
         if not synchronous_timeout.get("timed_out"):
             raise RuntimeError(f"synchronous timeout was not reported: {synchronous_timeout}")
         child_pid = int(Path(workspace, "sync-child.pid").read_text(encoding="utf-8"))
@@ -224,18 +353,86 @@ def main() -> None:
         else:
             raise RuntimeError("synchronous timeout left a descendant process running")
 
-        cancellable = server.run_workspace_code(
+        cancellable = asyncio.run(server.run_workspace_code(
             "python",
             "import time; time.sleep(60)",
             background=True,
             timeout_seconds=30,
-        )
-        cancelled = server.cancel_workspace_task(
+        ))
+        cancelled = asyncio.run(server.cancel_workspace_task(
             cancellable["task_id"],
             wait_seconds=3,
-        )
+        ))
         if cancelled["status"] != "cancelled":
             raise RuntimeError(f"background cancellation failed: {cancelled}")
+
+        # Foreground capture must stay bounded even for very noisy commands.
+        noisy_foreground = asyncio.run(
+            server.run_workspace_code(
+                "python",
+                "import sys; sys.stdout.write('x' * 3000000)",
+                timeout_seconds=10,
+            )
+        )
+        if not noisy_foreground["truncated"] or len(noisy_foreground["stdout"]) > server.CONFIG.max_output_chars:
+            raise RuntimeError("foreground output capture was not bounded")
+
+        # Background logs must stay within the configured on-disk budget.
+        noisy_background = asyncio.run(
+            server.run_workspace_code(
+                "python",
+                "import sys; sys.stdout.write('y' * 5000000)",
+                background=True,
+                timeout_seconds=20,
+            )
+        )
+        noisy_done = asyncio.run(
+            server.get_workspace_task(noisy_background["task_id"], wait_seconds=10)
+        )
+        if noisy_done["status"] != "succeeded" or not noisy_done.get("stdout_truncated"):
+            raise RuntimeError(f"background log truncation was not reported: {noisy_done}")
+        noisy_log = Path(workspace, noisy_done["stdout_path"])
+        if noisy_log.stat().st_size > server.CONFIG.max_background_log_bytes:
+            raise RuntimeError("background stdout log exceeded its storage budget")
+
+        # A dead runner must not leave its separately-sessioned workload alive.
+        orphaned = asyncio.run(
+            server.run_workspace_code(
+                "python",
+                "import time; time.sleep(60)",
+                background=True,
+                timeout_seconds=60,
+            )
+        )
+        orphan_status_path = Path(workspace, orphaned["task_dir"], "status.json")
+        deadline = time.monotonic() + 5
+        orphan_status = {}
+        while time.monotonic() < deadline:
+            orphan_status = json.loads(orphan_status_path.read_text(encoding="utf-8"))
+            if orphan_status.get("status") == "running" and orphan_status.get("pid"):
+                break
+            time.sleep(0.05)
+        else:
+            raise RuntimeError(f"background task never reached running: {orphan_status}")
+        workload_pid = int(orphan_status["pid"])
+        os.kill(int(orphan_status["worker_pid"]), 9)
+        recovered = asyncio.run(server.get_workspace_task(orphaned["task_id"], wait_seconds=3))
+        if recovered["status"] != "failed":
+            raise RuntimeError(f"dead-runner recovery did not fail task: {recovered}")
+        time.sleep(0.1)
+        try:
+            os.kill(workload_pid, 0)
+        except ProcessLookupError:
+            pass
+        else:
+            raise RuntimeError("dead-runner recovery left workload running")
+
+        # Large file reads must enforce response bounds without materializing all data.
+        large_file = Path(workspace, file_api_root, "large.txt")
+        large_file.write_text("z" * 3000000, encoding="utf-8")
+        large_read = server.read_workspace_file(f"{file_api_root}/large.txt")
+        if not large_read["truncated"] or len(large_read["content"]) != server.CONFIG.max_read_chars:
+            raise RuntimeError("large workspace read did not enforce its bound")
 
         old_finished = (datetime.now(UTC) - timedelta(days=31)).isoformat()
         recent_finished = datetime.now(UTC).isoformat()
@@ -260,52 +457,107 @@ def main() -> None:
             if not Path(workspace, ".mcp-tasks", task_id).is_dir():
                 raise RuntimeError(f"active or recent task was removed: {task_id}")
 
-        long_poll_task_id = "task_00000000000000000000000000000004"
-        long_poll_dir = Path(workspace, ".mcp-tasks", long_poll_task_id)
-        long_poll_dir.mkdir()
-        long_poll_status = long_poll_dir / "status.json"
-        long_poll_status.write_text(
-            json.dumps({"task_id": long_poll_task_id, "status": "queued"}),
-            encoding="utf-8",
-        )
-
-        def complete_long_poll_task() -> None:
-            time.sleep(0.2)
-            server._write_task_json(
-                long_poll_status,
-                {"task_id": long_poll_task_id, "status": "succeeded"},
+        async def verify_nonblocking_task_wait() -> None:
+            task = await server.run_workspace_code(
+                "python", "import time; time.sleep(0.35)", background=True, timeout_seconds=5
             )
-
-        updater = threading.Thread(target=complete_long_poll_task)
-        updater.start()
-        started = time.monotonic()
-        long_poll_result = server.get_workspace_task(
-            long_poll_task_id, wait_seconds=2
-        )
-        elapsed = time.monotonic() - started
-        updater.join()
-        if long_poll_result["status"] != "succeeded" or elapsed >= 2:
-            raise RuntimeError(
-                f"long poll did not return after task completion: {long_poll_result}"
+            poll = asyncio.create_task(
+                server.get_workspace_task(task["task_id"], wait_seconds=2)
             )
-        if "stdout_tail" in long_poll_result or "stderr_tail" in long_poll_result:
-            raise RuntimeError("task status unexpectedly returned log content")
+            await asyncio.sleep(0.05)
+            started_read = time.monotonic()
+            server.read_workspace_file(f"{file_api_root}/probe.txt")
+            if time.monotonic() - started_read > 0.2:
+                raise RuntimeError("long poll blocked an unrelated file read")
+            result = await poll
+            if result["status"] != "succeeded":
+                raise RuntimeError(f"long poll did not converge to success: {result}")
+
+            started = time.monotonic()
+            foreground = asyncio.create_task(
+                server.run_workspace_code(
+                    "python", "import time; time.sleep(0.35)", timeout_seconds=2
+                )
+            )
+            await asyncio.sleep(0.05)
+            if time.monotonic() - started > 0.2:
+                raise RuntimeError("foreground command blocked the event loop")
+            server.read_workspace_file(f"{file_api_root}/probe.txt")
+            foreground_result = await foreground
+            if foreground_result["exit_code"] != 0:
+                raise RuntimeError(f"foreground command failed: {foreground_result}")
+
+        server.write_workspace_file(f"{file_api_root}/probe.txt", "probe\n")
+        asyncio.run(verify_nonblocking_task_wait())
+
         try:
-            server.get_workspace_task(
-                long_poll_task_id,
-                wait_seconds=server.CONFIG.task_max_wait_seconds + 1,
+            asyncio.run(
+                server.get_workspace_task(
+                    "task_00000000000000000000000000000001",
+                    wait_seconds=server.CONFIG.task_max_wait_seconds + 1,
+                )
             )
         except ValueError:
             pass
         else:
             raise RuntimeError("task wait above the configured maximum was accepted")
 
+        draft_root = Path(workspace, "draft")
+        draft_root.mkdir()
+        import subprocess
+        subprocess.run(["git", "init"], cwd=draft_root, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=draft_root, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=draft_root, check=True)
+        draft_root.joinpath("a.md").write_text("a\n", encoding="utf-8")
+        draft_root.joinpath("b.md").write_text("b\n", encoding="utf-8")
+        draft_root.joinpath("[x].md").write_text("x\n", encoding="utf-8")
+        subprocess.run(["git", "add", "--", "a.md", "b.md", "[x].md"], cwd=draft_root, check=True)
+        subprocess.run(["git", "commit", "-m", "initial"], cwd=draft_root, check=True, capture_output=True)
+        draft_root.joinpath("a.md").write_text("a2\n", encoding="utf-8")
+        draft_root.joinpath("b.md").write_text("b2\n", encoding="utf-8")
+        draft_root.joinpath("[x].md").write_text("x2\n", encoding="utf-8")
+        try:
+            server._git_diff_for_file("*")
+        except ValueError:
+            pass
+        else:
+            raise RuntimeError("literal single-file Git API expanded '*' as a pathspec")
+        nested_dir = draft_root / "nested"
+        nested_dir.mkdir()
+        nested_dir.joinpath("c.md").write_text("c\n", encoding="utf-8")
+        subprocess.run(["git", "add", "--", "nested/c.md"], cwd=draft_root, check=True)
+        subprocess.run(["git", "commit", "-m", "add nested"], cwd=draft_root, check=True, capture_output=True)
+        nested_dir.joinpath("c.md").write_text("c2\n", encoding="utf-8")
+        try:
+            server._git_diff_for_file("nested")
+        except ValueError:
+            pass
+        else:
+            raise RuntimeError("single-file Git API accepted a directory path")
+        bracket_diff = server._git_diff_for_file("[x].md")
+        if "[x].md" not in bracket_diff or "a.md" in bracket_diff or "b.md" in bracket_diff:
+            raise RuntimeError(f"literal metacharacter filename diff leaked siblings: {bracket_diff}")
+
         delegated_task = "THIS_CONTENT_MUST_NOT_BE_IN_THE_BROWSER_PROMPT"
-        with patch.object(
-            server,
-            "_start_workspace_task",
-            return_value={"task_id": "task_demo", "status": "queued"},
-        ) as mocked_start:
+        demo_task_id = "task_" + "d" * 32
+        demo_task_dir = Path(workspace, ".mcp-tasks", demo_task_id).resolve()
+        demo_task_dir.mkdir()
+        with (
+            patch.object(
+                server, "_reserve_workspace_task_dir", return_value=(demo_task_id, demo_task_dir)
+            ),
+            patch.object(
+                server,
+                "_start_workspace_task",
+                return_value={
+                    "task_id": demo_task_id,
+                    "status": "queued",
+                    "task_dir": f".mcp-tasks/{demo_task_id}",
+                    "stdout_path": f".mcp-tasks/{demo_task_id}/stdout.log",
+                    "stderr_path": f".mcp-tasks/{demo_task_id}/stderr.log",
+                },
+            ) as mocked_start,
+        ):
             delegated = server.spawn_chatgpt_subagent(delegated_task)
         task_code = mocked_start.call_args.args[1]
         if delegated_task in task_code:
@@ -328,7 +580,11 @@ def main() -> None:
             delegated["output_path"]
         ).parent:
             raise RuntimeError(f"allocated paths do not share one directory: {delegated}")
-        if delegated["status"] != "queued" or delegated["task_id"] != "task_demo":
+        if Path(workspace, delegated["output_path"]).exists():
+            raise RuntimeError("sub-agent output was pre-created instead of child-created")
+        if not delegated["input_path"].startswith(f".mcp-tasks/{demo_task_id}/"):
+            raise RuntimeError(f"sub-agent artifacts are not task-owned: {delegated}")
+        if delegated["status"] != "queued" or delegated["task_id"] != demo_task_id:
             raise RuntimeError(f"sub-agent was not queued asynchronously: {delegated}")
         try:
             server.spawn_chatgpt_subagent("   ")

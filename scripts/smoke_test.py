@@ -51,6 +51,13 @@ def structured_result(result) -> dict[str, object]:
     return nested if isinstance(nested, dict) else payload
 
 
+async def call_tool_once(url: str, name: str, arguments: dict[str, object]):
+    async with streamablehttp_client(url) as (read_stream, write_stream, _):
+        async with ClientSession(read_stream, write_stream) as session:
+            await session.initialize()
+            return await session.call_tool(name, arguments)
+
+
 async def wait_for_task(session: ClientSession, task_id: str) -> dict[str, object]:
     for _ in range(100):
         result = await session.call_tool(
@@ -60,7 +67,7 @@ async def wait_for_task(session: ClientSession, task_id: str) -> dict[str, objec
         if result.isError:
             raise RuntimeError(f"get_workspace_task failed: {result}")
         payload = structured_result(result)
-        if payload["status"] in {"succeeded", "failed", "timed_out"}:
+        if payload["status"] in {"succeeded", "failed", "timed_out", "cancelled"}:
             return payload
         await asyncio.sleep(0.1)
     raise RuntimeError(f"background task did not finish: {task_id}")
@@ -140,6 +147,67 @@ async def main(url: str) -> None:
             read_back = await session.call_tool(
                 "read_workspace_file", {"path": SMOKE_FILE}
             )
+            # Protocol-level responsiveness: one blocking-style operation on one
+            # connection must not head-of-line-block an unrelated connection.
+            responsiveness_task = await session.call_tool(
+                "run_workspace_code",
+                {
+                    "language": "python",
+                    "code": "import time; time.sleep(1.2)",
+                    "background": True,
+                    "timeout_seconds": 5,
+                },
+            )
+            if responsiveness_task.isError:
+                raise RuntimeError(f"responsiveness task failed to start: {responsiveness_task}")
+            responsiveness_id = str(structured_result(responsiveness_task)["task_id"])
+            poll_call = asyncio.create_task(
+                call_tool_once(
+                    url,
+                    "get_workspace_task",
+                    {"task_id": responsiveness_id, "wait_seconds": 2},
+                )
+            )
+            await asyncio.sleep(0.1)
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            concurrent_read = await call_tool_once(
+                url, "read_workspace_file", {"path": SMOKE_FILE}
+            )
+            read_elapsed = loop.time() - started
+            if concurrent_read.isError or read_elapsed > 0.75:
+                raise RuntimeError(
+                    f"long poll blocked unrelated MCP traffic for {read_elapsed:.3f}s"
+                )
+            await poll_call
+
+            foreground_call = asyncio.create_task(
+                call_tool_once(
+                    url,
+                    "run_workspace_code",
+                    {
+                        "language": "python",
+                        "code": "import time; time.sleep(1.2)",
+                        "timeout_seconds": 5,
+                    },
+                )
+            )
+            await asyncio.sleep(0.1)
+            started = loop.time()
+            concurrent_read = await call_tool_once(
+                url, "read_workspace_file", {"path": SMOKE_FILE}
+            )
+            foreground_read_elapsed = loop.time() - started
+            foreground_result = await foreground_call
+            if (
+                concurrent_read.isError
+                or foreground_result.isError
+                or foreground_read_elapsed > 0.75
+            ):
+                raise RuntimeError(
+                    "foreground execution blocked unrelated MCP traffic: "
+                    f"{foreground_read_elapsed:.3f}s"
+                )
             guard_created = await session.call_tool(
                 "write_workspace_file",
                 {
@@ -410,6 +478,8 @@ async def main(url: str) -> None:
                 reverted.get("action") == "deleted" and reverted_file.isError,
             )
             print("python execution:", "python execution ok" in executed.content[0].text)
+            print("protocol long-poll concurrency:", read_elapsed <= 0.75)
+            print("protocol foreground concurrency:", foreground_read_elapsed <= 0.75)
             print(
                 "background execution:",
                 background_result["status"] == "succeeded"
@@ -428,7 +498,8 @@ async def main(url: str) -> None:
                         "draft/.mcp-revert-smoke-test.md; "
                         f"rm -rf -- .mcp-tasks/{background_task_id} "
                         f".mcp-tasks/{timeout_task_id} "
-                        f".mcp-tasks/{cancellable_task_id}"
+                        f".mcp-tasks/{cancellable_task_id} "
+                        f".mcp-tasks/{responsiveness_id}"
                     ),
                     "cwd": ".",
                 },

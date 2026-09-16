@@ -111,7 +111,7 @@ shell `rm` / `mv` 代替已有的安全文件工具。
 默认值和上限集中定义在 `config.py`。
 
 直接在 macOS/Linux 运行时，子进程继承当前用户的 `HOME`，便于使用 Whisper 缓存和
-DaVinci Resolve。Docker 部署则通过 `MCP_EXECUTION_HOME=/tmp/mcp-home` 保持原行为。
+DaVinci Resolve。Docker 部署通过 `MCP_EXECUTION_HOME=/tmp/mcp-home` 使用独立的临时 HOME。
 
 Compose 使用 `restart: unless-stopped`；只要宿主机 Docker 服务会在启动时恢复，MCP
 容器也会自动恢复。Agent 修改项目内的 Python 后，可以调用 `restart_mcp_server` 热加载
@@ -151,8 +151,8 @@ Makefile 会把 `ENV_FILE`（默认 `./.env`）显式传给 Compose；直接运�
 时 Compose 仍按默认规则读取项目目录的 `.env`。容器内部 workspace 保持为
 `/opt/workspace`；`MCP_WORKSPACE_HOST_PATH` 只表示 bind mount 的宿主机路径。
 `MCP_PORT` 会同时控制服务监听端口、端口映射、Makefile 健康检查和 smoke test。
-ChatGPT profile 默认直接保存在代码库的 `chatgpt-profile/`，通过 workspace 挂载自然
-持久化，不再需要独立 volume；该目录已被 Git 和 Docker build context 忽略。
+ChatGPT profile 默认直接保存在代码库的 `chatgpt-profile/`，通过 workspace 挂载持久化；
+该目录已被 Git 和 Docker build context 忽略。
 
 如果同一个 checkout 还需要和远端工作副本双向同步，在 `.env` 中增加：
 
@@ -164,7 +164,9 @@ MCP_SYNC_REMOTE_DIR=/absolute/path/to/remote/mymcp
 
 随后使用 `make sync-down` / `make sync-up`。如果 host 和 remote directory 都为空，这两个
 目标会明确跳过，因此共享仓库不依赖任何特定的 SSH 环境。`sync-down` 在本地存在 staged、
-unstaged 或 untracked 修改时会拒绝覆盖；同步策略默认不使用 `--delete`。
+unstaged 或 untracked 修改时会拒绝覆盖；当明确要让 remote 覆盖本地工作区时，使用
+`make sync-down force`（或 `make sync-down FORCE=1`）跳过这一 Git dirty-worktree guard。
+同步策略默认不使用 `--delete`。
 
 可选的额外 bind mount 放在 `compose.additional.yaml`。默认不加载该文件，因此无需设置
 额外路径也能正常运行。需要挂载时，在 `.env` 中启用 overlay，并配置宿主机路径、容器
@@ -198,18 +200,19 @@ MCP_EXECUTION_HOME=
 `make apply-config`，仅修改直接运行的 Python 配置则重启进程。
 
 `.env` 只保留机器路径、SSH/sync endpoint、端口、密码、显示名、容器 UID/GID、资源额度
-以及浏览器运行模式等部署差异。目录结构、协议路径、超时、大小限制、Git diff 策略、任务
-保留期和完成标记等稳定策略直接定义在 `config.py`，不再在 Compose 和 `.env` 重复一份
-默认值。
+以及浏览器运行模式等部署差异。目录结构、协议路径、超时、大小限制、Git diff 策略和任务
+保留期等稳定策略只在 `config.py` 中定义；sub-agent 生命周期标记是
+`chatgpt_playwright.py` 中的固定协议常量。
 
 ## ChatGPT sub-agent automation
 
 这个接口默认关闭。Docker 镜像包含 Playwright Chromium；本地直接运行时则需要另行安装
 浏览器依赖。
-调用 `spawn_chatgpt_subagent` 时直接传入完整任务即可。工具会在
-`temp/<uid>/` 内自动创建 `input.md` 和 `output.md`，原子写入任务，再把这两个路径代入
-固定模板；任务正文不会复制进浏览器。新的 ChatGPT 对话会使用名为 `writer` 的 MCP
-读取输入，并将全部结果写入 output。
+调用 `spawn_chatgpt_subagent` 时直接传入完整任务即可。每个 sub-agent 复用标准后台任务目录：
+`.mcp-tasks/task_<uuid>/` 同时保存 `request.json`、`status.json`、stdout/stderr、`input.md`
+和最终的 `output.md`。`input.md` 在启动前创建，`output.md` 由 child 首次创建；任务正文不会
+复制进浏览器。新的 ChatGPT 对话会使用名为 `writer` 的 MCP 读取输入，并将全部结果写入
+该 task 自己的 output。整个目录随标准 task retention 一起清理。
 
 安装本地可选依赖并进行一次登录：
 
@@ -251,35 +254,43 @@ MCP_WORKSPACE_ROOT=/absolute/path/to/workspace
 
 ```bash
 python chatgpt_playwright.py send \
-  --input-path temp/0123456789abcdef0123456789abcdef/input.md \
-  --output-path temp/0123456789abcdef0123456789abcdef/output.md
+  --input-path .mcp-tasks/task_0123456789abcdef0123456789abcdef/input.md \
+  --output-path .mcp-tasks/task_0123456789abcdef0123456789abcdef/output.md
 ```
 
 CLI 只验证它们是安全的 workspace 相对路径，在临时对话中输入提示词并点击官方发送
 按钮后打印 `sent`。它不要求本地存在远端文件，也不检测远端任务完成。
 
-MCP 后台任务通过 `config.py` 中固定的完成标记检测真正完成：
+MCP 后台任务使用两个固定标记区分“网页端已经开始执行”和“结果已经完成”：
 
 ```text
+started sentinel:    WRITERSUBAGENTSTARTED4C81E2B5
 completion sentinel: WRITERSUBAGENTCOMPLETE7D3A9F6C
+start timeout:       300 seconds
 completion timeout:  3600 seconds
 ```
 
-默认等待输出文件完成 1 小时；Playwright 启动和发送还预留了少量额外时间。到达后台任务
-总超时后，浏览器任务会被终止，状态变为 `timed_out`。
+网页端的第一项操作是创建 `output.md` 并写入 started sentinel。Playwright 检测到该标记后即可
+关闭页面；网页端随后用带 SHA-256 guard 的原子覆盖写入最终结果和 completion sentinel。默认
+远端 completion wait 为 1 小时，而且这个计时从 started acknowledgement 后开始。外层后台
+supervisor 使用更大的任务上限覆盖 browser queue/setup、started acknowledgement 和 completion
+三个阶段；若外层任务最终超时，整个受控 process group 会被终止并进入 `timed_out`。
 
 默认打开 `https://chatgpt.com/?temporary-chat=true`。脚本一次性填写提示词，并在点击
-发送前确认当前编辑器仍包含唯一的 input 路径、output 路径和完成标记；缺失时不会发送。
+发送前确认当前编辑器仍包含唯一的 input 路径、output 路径和两个生命周期标记；缺失时不会发送。
 
 通过 MCP 调用时，`spawn_chatgpt_subagent` 不阻塞等待结果，而是立即返回后台
 `task_id`。把这个 id 传给现有的 `get_workspace_task` 轮询：`queued` 或 `running` 表示
 仍在处理，`succeeded` 表示输出文件已经更新且检测到末尾标记；`failed` 或 `timed_out`
 表示没有正常完成。完整执行结果和临时页面 URL 保存在该任务的 stdout 日志中。
 
-多个 sub-agent 可以并发等待结果，但共享 Chromium profile 的发送阶段会通过跨进程文件锁
-串行化：获取 profile、填写并验证 prompt、点击发送并关闭 context 后立即释放锁。这样避免
-persistent profile 的并发竞争，同时不会把整个 sub-agent completion wait 串行化。ChatGPT
-DOM 变化或登录过期时，仍需要重新登录或更新 `chatgpt_playwright.py` 中的选择器。
+登录 profile 是只读模板。每个浏览器任务先在短暂的跨进程锁内，把必要的登录状态复制到
+repo 内 `chatgpt-task-profiles/slot_00` 至 `slot_09` 的独立运行槽，再填写并验证 prompt、点击
+发送，并保持临时对话打开，直到 `output.md` 出现 started sentinel。随后会关闭 context、清空
+槽内 profile，并在后台等待 completion sentinel。固定槽把浏览器并发限制为 10，也限制了临时
+profile 的最大数量；该目录被 Git、Docker build、rsync 和 Syncthing 忽略。多个 sub-agent 及
+递归委派不会并发写入持久登录 profile。`spawn_chatgpt_subagent` 会立即返回后台 task。ChatGPT
+DOM 变化或登录过期时，需要重新登录或更新 `chatgpt_playwright.py` 中的选择器。
 
 ### VPS browser login
 
@@ -331,4 +342,4 @@ make debug-ui
 make debug-ui-down
 ```
 
-正常模式仍会在发送后立即关闭浏览器。
+正常模式会在 sub-agent 写回 started sentinel 后关闭浏览器；调试模式额外保留页面 60 秒。

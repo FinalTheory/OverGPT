@@ -10,7 +10,7 @@ make sync-down
 
 Remote synchronization is configured only through `.env`. If no `MCP_SYNC_HOST` / `MCP_SYNC_REMOTE_DIR` pair is configured, `make sync-down` is intentionally a no-op and development can continue locally.
 
-When remote sync is configured, `make sync-down` must refuse to overwrite a repository with staged, unstaged, or untracked changes. If that happens, stop before making further changes and tell the user that local work exists while the remote workspace has not yet been reconciled. Do not decide which copy should win without explicit user direction.
+When remote sync is configured, `make sync-down` must refuse to overwrite a repository with staged, unstaged, or untracked changes. If that happens, stop before making further changes and tell the user that local work exists while the remote workspace has not yet been reconciled. Do not decide which copy should win without explicit user direction. When the user explicitly says the remote copy should win, use `make sync-down force` (equivalently `make sync-down FORCE=1`) to bypass only this Git dirty-worktree guard.
 
 After a successful sync, inspect `git status` and relevant diffs before continuing development.
 

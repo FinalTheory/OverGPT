@@ -7,6 +7,7 @@ RSYNC_FLAGS = -av --itemize-changes \
 	--exclude='.git/' \
 	--exclude='.env' \
 	--exclude='chatgpt-profile/' \
+	--exclude='chatgpt-task-profiles/' \
 	--exclude='.mcp-tasks/' \
 	--exclude='.ruff_cache/' \
 	--exclude='temp/' \

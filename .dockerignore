@@ -7,3 +7,4 @@ temp/
 .git/
 .env
 chatgpt-profile/
+chatgpt-task-profiles/
