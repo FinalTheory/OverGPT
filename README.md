@@ -284,12 +284,16 @@ supervisor 使用更大的任务上限覆盖 browser queue/setup、文件创建�
 表示没有正常完成。完整执行结果和临时页面 URL 保存在该任务的 stdout 日志中。
 
 登录 profile 是只读模板。每个浏览器任务先在短暂的跨进程锁内，把必要的登录状态复制到
-repo 内 `chatgpt-task-profiles/slot_00` 至 `slot_09` 的独立运行槽，再填写并验证 prompt、点击
+repo 内 `chatgpt-task-profiles/slot_00` 至 `slot_04` 的独立运行槽，再填写并验证 prompt、点击
 发送，并保持临时对话打开，直到 `output.md` 被创建。随后会关闭 context、清空槽内 profile，
-并在后台等待 completion sentinel。固定槽把浏览器并发限制为 10，也限制了临时
+并在后台等待 completion sentinel。固定槽把浏览器并发限制为 5，也限制了临时
 profile 的最大数量；该目录被 Git、Docker build、rsync 和 Syncthing 忽略。多个 sub-agent 及
 递归委派不会并发写入持久登录 profile。`spawn_chatgpt_subagent` 会立即返回后台 task。ChatGPT
 DOM 变化或登录过期时，需要重新登录或更新 `chatgpt_playwright.py` 中的选择器。
+
+`spawn_chatgpt_subagent` 会在接受任务前原子预留一个浏览器槽。五个槽都被占用或预留时，
+工具调用直接返回 capacity error，不创建后台排队任务；调用方应等待已有任务创建其
+`output.md`、释放浏览器槽后再决定是否发起新的委派。
 
 ### VPS browser login
 

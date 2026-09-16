@@ -12,7 +12,7 @@ import subprocess
 import sys
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
-from time import monotonic, sleep
+from time import monotonic, sleep, time
 from typing import Any, Callable, Iterator
 
 sys.dont_write_bytecode = True
@@ -34,7 +34,7 @@ DEBUG_UI_HOLD_FILE = Path("/tmp/mymcp-debug-ui/hold-browser-open")
 DEBUG_UI_HOLD_SECONDS = 60
 SUBAGENT_COMPLETED_SENTINEL = "WRITERSUBAGENTCOMPLETE7D3A9F6C"
 SUBAGENT_CREATION_TIMEOUT_SECONDS = 300
-BROWSER_TASK_CONCURRENCY = 10
+BROWSER_TASK_CONCURRENCY = 5
 TASK_PROFILES_ROOT = Path(__file__).resolve().parent / "chatgpt-task-profiles"
 
 
@@ -48,6 +48,10 @@ class ChatGPTRateLimitError(RuntimeError):
 
 class ChatGPTPostSendError(RuntimeError):
     """Failure after Send that must never trigger another submission."""
+
+
+class ChatGPTCapacityError(RuntimeError):
+    """All bounded browser profile slots are occupied or reserved."""
 
 
 
@@ -95,35 +99,163 @@ def _clone_browser_profile(source: Path, destination: Path) -> None:
         )
 
 
-@contextmanager
-def _browser_task_profile(source: Path) -> Iterator[Path]:
-    """Lease one of ten bounded repo-local profile slots."""
-    TASK_PROFILES_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
-    while True:
-        for index in range(BROWSER_TASK_CONCURRENCY):
-            slot_dir = TASK_PROFILES_ROOT / f"slot_{index:02d}"
-            slot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-            lock_handle = (slot_dir / ".lock").open("a+b")
-            try:
-                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                lock_handle.close()
-                continue
+def _slot_directory(index: int) -> Path:
+    if not 0 <= index < BROWSER_TASK_CONCURRENCY:
+        raise ValueError("browser slot index is out of range")
+    return TASK_PROFILES_ROOT / f"slot_{index:02d}"
 
-            profile_dir = slot_dir / "profile"
+
+def _read_slot_reservation(path: Path) -> dict[str, Any] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError):
+        return {"invalid": True}
+    return value if isinstance(value, dict) else {"invalid": True}
+
+
+def _reservation_is_stale(path: Path, reservation: dict[str, Any]) -> bool:
+    task_dir_value = reservation.get("task_dir")
+    if isinstance(task_dir_value, str):
+        status_path = Path(task_dir_value) / "status.json"
+        try:
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
             try:
-                if profile_dir.exists():
-                    shutil.rmtree(profile_dir)
-                with _browser_profile_lock(source):
-                    _clone_browser_profile(source, profile_dir)
-                yield profile_dir
-            finally:
-                if profile_dir.exists():
-                    shutil.rmtree(profile_dir)
-                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
-                lock_handle.close()
-            return
-        sleep(0.2)
+                return time() - path.stat().st_mtime > 60
+            except OSError:
+                return False
+        except (OSError, json.JSONDecodeError):
+            return False
+        return isinstance(status, dict) and status.get("status") in {
+            "succeeded", "failed", "timed_out", "cancelled"
+        }
+    return False
+
+
+def _write_slot_reservation(path: Path, task_id: str, task_dir: Path) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    payload = json.dumps(
+        {"task_id": task_id, "task_dir": str(task_dir.resolve())},
+        ensure_ascii=False,
+    )
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def reserve_browser_slot(task_id: str, task_dir: Path) -> int:
+    """Atomically reserve browser capacity before an MCP task is accepted."""
+    TASK_PROFILES_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for index in range(BROWSER_TASK_CONCURRENCY):
+        slot_dir = _slot_directory(index)
+        slot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lock_handle = (slot_dir / ".lock").open("a+b")
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock_handle.close()
+            continue
+        try:
+            reservation_path = slot_dir / "reservation.json"
+            reservation = _read_slot_reservation(reservation_path)
+            if reservation is not None and _reservation_is_stale(
+                reservation_path, reservation
+            ):
+                reservation_path.unlink(missing_ok=True)
+                reservation = None
+            if reservation is not None:
+                continue
+            _write_slot_reservation(reservation_path, task_id, task_dir)
+            return index
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            lock_handle.close()
+    raise ChatGPTCapacityError(
+        f"ChatGPT browser capacity is full ({BROWSER_TASK_CONCURRENCY} concurrent tasks); "
+        "do not start another sub-agent until an active task acknowledges execution"
+    )
+
+
+def release_browser_slot(task_id: str, slot_index: int) -> None:
+    """Release one matching reservation without disturbing another owner."""
+    slot_dir = _slot_directory(slot_index)
+    lock_handle = (slot_dir / ".lock").open("a+b")
+    try:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        reservation_path = slot_dir / "reservation.json"
+        reservation = _read_slot_reservation(reservation_path)
+        if reservation is not None and reservation.get("task_id") == task_id:
+            reservation_path.unlink(missing_ok=True)
+    finally:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        lock_handle.close()
+
+
+@contextmanager
+def _browser_task_profile(
+    source: Path,
+    *,
+    reservation_task_id: str | None = None,
+    reservation_slot: int | None = None,
+) -> Iterator[Path]:
+    """Lease one bounded repo-local profile slot."""
+    TASK_PROFILES_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    reserved = reservation_task_id is not None or reservation_slot is not None
+    if reserved and (reservation_task_id is None or reservation_slot is None):
+        raise ValueError("reservation task ID and slot must be supplied together")
+    indices = (
+        [reservation_slot]
+        if reservation_slot is not None
+        else list(range(BROWSER_TASK_CONCURRENCY))
+    )
+    for index in indices:
+        slot_dir = _slot_directory(index)
+        slot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lock_handle = (slot_dir / ".lock").open("a+b")
+        try:
+            if reserved:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            else:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock_handle.close()
+            continue
+
+        profile_dir = slot_dir / "profile"
+        try:
+            reservation = _read_slot_reservation(slot_dir / "reservation.json")
+            if reserved and (
+                reservation is None
+                or reservation.get("task_id") != reservation_task_id
+            ):
+                raise RuntimeError("browser slot reservation is missing or owned by another task")
+            if not reserved and reservation is not None:
+                continue
+            if profile_dir.exists():
+                shutil.rmtree(profile_dir)
+            with _browser_profile_lock(source):
+                _clone_browser_profile(source, profile_dir)
+            yield profile_dir
+        finally:
+            if profile_dir.exists():
+                shutil.rmtree(profile_dir)
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            lock_handle.close()
+        return
+    raise ChatGPTCapacityError(
+        f"ChatGPT browser capacity is full ({BROWSER_TASK_CONCURRENCY} concurrent tasks)"
+    )
 
 
 def render_subagent_prompt(
@@ -365,6 +497,8 @@ def send_prompt(
     timeout_seconds: int,
     verification_markers: tuple[str, ...],
     acknowledgement_wait: Callable[[], float] | None = None,
+    reservation_task_id: str | None = None,
+    reservation_slot: int | None = None,
 ) -> dict[str, Any]:
     """Send one verified prompt with bounded retries only before Send."""
     if not prompt.strip():
@@ -398,7 +532,11 @@ def send_prompt(
     for attempt in range(1, attempts + 1):
         click_may_have_committed = False
         try:
-            with _browser_task_profile(profile_dir) as attempt_profile:
+            with _browser_task_profile(
+                profile_dir,
+                reservation_task_id=reservation_task_id,
+                reservation_slot=reservation_slot,
+            ) as attempt_profile:
                 with sync_playwright() as playwright:
                     options: dict[str, Any] = {
                         "user_data_dir": str(attempt_profile),
@@ -443,6 +581,15 @@ def send_prompt(
                                 result["acknowledgement_wait_seconds"] = round(
                                     acknowledgement_wait(), 3
                                 )
+                                if reservation_task_id is not None:
+                                    reservation_path = (
+                                        _slot_directory(reservation_slot) / "reservation.json"
+                                    )
+                                    reservation = _read_slot_reservation(reservation_path)
+                                    if reservation is not None and reservation.get(
+                                        "task_id"
+                                    ) == reservation_task_id:
+                                        reservation_path.unlink(missing_ok=True)
                             except Exception as error:
                                 raise ChatGPTPostSendError(
                                     f"sub-agent did not acknowledge start after Send: {error}"
@@ -461,11 +608,15 @@ def send_prompt(
                             if not click_may_have_committed:
                                 raise
         except (ChatGPTRateLimitError, ChatGPTPostSendError):
+            if reservation_task_id is not None and reservation_slot is not None:
+                release_browser_slot(reservation_task_id, reservation_slot)
             raise
         except ChatGPTPreSendError as error:
             last_error = error
         except PlaywrightError as error:
             if click_may_have_committed:
+                if reservation_task_id is not None and reservation_slot is not None:
+                    release_browser_slot(reservation_task_id, reservation_slot)
                 return {
                     "status": "sent_ambiguous",
                     "page_url": url,
@@ -477,17 +628,23 @@ def send_prompt(
             )
         except Exception as error:
             if click_may_have_committed:
+                if reservation_task_id is not None and reservation_slot is not None:
+                    release_browser_slot(reservation_task_id, reservation_slot)
                 return {
                     "status": "sent_ambiguous",
                     "page_url": url,
                     "send_method": "button",
                     "warning": f"automation failed after Send may have started: {error}",
                 }
+            if reservation_task_id is not None and reservation_slot is not None:
+                release_browser_slot(reservation_task_id, reservation_slot)
             raise
 
         if attempt < attempts:
             sleep(min(2.0, 0.5 * attempt))
 
+    if reservation_task_id is not None and reservation_slot is not None:
+        release_browser_slot(reservation_task_id, reservation_slot)
     raise RuntimeError(
         f"ChatGPT pre-send automation failed after {attempts} attempts: {last_error}"
     ) from last_error
@@ -568,6 +725,7 @@ def send_subagent_task(
     output_path: str,
     *,
     wait_for_completion: bool,
+    reservation_slot: int | None = None,
 ) -> dict[str, Any]:
     """Send one allocator-issued sub-agent task and optionally wait for its file result."""
     from config import CONFIG
@@ -576,7 +734,7 @@ def send_subagent_task(
     normalized_output = normalize_workspace_relative_path(output_path)
     if normalized_input == normalized_output:
         raise ValueError("input_path and output_path must be different files")
-    validate_subagent_path_pair(
+    task_id = validate_subagent_path_pair(
         normalized_input, normalized_output, CONFIG.tasks_dirname
     )
     prompt = render_subagent_prompt(
@@ -619,6 +777,8 @@ def send_subagent_task(
             if output_file is not None
             else None
         ),
+        reservation_task_id=task_id if reservation_slot is not None else None,
+        reservation_slot=reservation_slot,
     )
     if output_file is not None:
         waited = _wait_for_file_completion(

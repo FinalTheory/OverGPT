@@ -270,7 +270,30 @@ def main() -> None:
                     raise RuntimeError("leased browser profile omitted session state")
             if leased_profile.exists():
                 raise RuntimeError("leased browser profile was not cleaned up")
+
+            reservations: list[tuple[str, int]] = []
+            for index in range(chatgpt_playwright.BROWSER_TASK_CONCURRENCY):
+                task_id = f"task_{index:032x}"
+                task_dir = Path(temp_dir, task_id)
+                task_dir.mkdir()
+                slot = chatgpt_playwright.reserve_browser_slot(task_id, task_dir)
+                reservations.append((task_id, slot))
+            try:
+                overflow_dir = Path(temp_dir, "task_overflow")
+                overflow_dir.mkdir()
+                try:
+                    chatgpt_playwright.reserve_browser_slot(
+                        "task_ffffffffffffffffffffffffffffffff", overflow_dir
+                    )
+                except chatgpt_playwright.ChatGPTCapacityError:
+                    pass
+                else:
+                    raise RuntimeError("browser capacity accepted a sixth reservation")
+            finally:
+                for task_id, slot in reservations:
+                    chatgpt_playwright.release_browser_slot(task_id, slot)
     print("browser tasks receive isolated cache-free profile clones: ok")
+    print("browser capacity rejects reservations above five: ok")
 
     with tempfile.TemporaryDirectory(prefix="mymcp-workspace-") as workspace:
         os.environ["MCP_WORKSPACE_ROOT"] = workspace
@@ -558,6 +581,11 @@ def main() -> None:
                     "stderr_path": f".mcp-tasks/{demo_task_id}/stderr.log",
                 },
             ) as mocked_start,
+            patch.object(
+                chatgpt_playwright,
+                "reserve_browser_slot",
+                return_value=2,
+            ),
         ):
             delegated = server.spawn_chatgpt_subagent(delegated_task)
         task_code = mocked_start.call_args.args[1]
@@ -570,6 +598,7 @@ def main() -> None:
         if (
             delegated["input_path"] not in task_code
             or delegated["output_path"] not in task_code
+            or "reservation_slot=2" not in task_code
         ):
             raise RuntimeError(
                 "normalized paths were not passed to the background task"
@@ -587,12 +616,41 @@ def main() -> None:
             raise RuntimeError(f"sub-agent artifacts are not task-owned: {delegated}")
         if delegated["status"] != "queued" or delegated["task_id"] != demo_task_id:
             raise RuntimeError(f"sub-agent was not queued asynchronously: {delegated}")
+        if delegated["browser_slot"] != 2:
+            raise RuntimeError(f"sub-agent did not return its reserved slot: {delegated}")
         try:
             server.spawn_chatgpt_subagent("   ")
         except ValueError:
             pass
         else:
             raise RuntimeError("empty delegated task was accepted")
+
+        full_task_id = "task_" + "e" * 32
+        full_task_dir = Path(workspace, ".mcp-tasks", full_task_id).resolve()
+        full_task_dir.mkdir()
+        with (
+            patch.object(
+                server,
+                "_reserve_workspace_task_dir",
+                return_value=(full_task_id, full_task_dir),
+            ),
+            patch.object(
+                chatgpt_playwright,
+                "reserve_browser_slot",
+                side_effect=chatgpt_playwright.ChatGPTCapacityError(
+                    "ChatGPT browser capacity is full (5 concurrent tasks)"
+                ),
+            ),
+        ):
+            try:
+                server.spawn_chatgpt_subagent("capacity probe")
+            except chatgpt_playwright.ChatGPTCapacityError:
+                pass
+            else:
+                raise RuntimeError("full browser capacity did not reject sub-agent spawn")
+        if full_task_dir.exists():
+            raise RuntimeError("rejected sub-agent left an unstarted task directory")
+
         with (
             patch.object(
                 chatgpt_playwright,

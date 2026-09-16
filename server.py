@@ -225,7 +225,9 @@ def _render_chatgpt_subagent_prompt(input_path: str, output_path: str) -> str:
     )
 
 
-def _chatgpt_subagent_task_code(input_path: str, output_path: str) -> str:
+def _chatgpt_subagent_task_code(
+    input_path: str, output_path: str, reservation_slot: int
+) -> str:
     return "\n".join(
         [
             "import sys",
@@ -233,7 +235,8 @@ def _chatgpt_subagent_task_code(input_path: str, output_path: str) -> str:
             "from chatgpt_playwright import send_subagent_task",
             (
                 "result = send_subagent_task("
-                f"{input_path!r}, {output_path!r}, wait_for_completion=True)"
+                f"{input_path!r}, {output_path!r}, wait_for_completion=True, "
+                f"reservation_slot={reservation_slot!r})"
             ),
             "print(result)",
         ]
@@ -1296,7 +1299,8 @@ def spawn_chatgpt_subagent(task: str) -> dict[str, Any]:
     The delegated input, authoritative output, execution logs, and lifecycle state
     all live under the returned task_dir. output.md is absent while queued, created
     empty by the child to acknowledge execution, and atomically replaced by the
-    final result plus a fixed completion marker.
+    final result plus a fixed completion marker. Browser capacity is reserved before
+    this tool returns; when all five slots are occupied, the call fails immediately.
     """
     if not CONFIG.chatgpt_automation_enabled:
         raise RuntimeError(
@@ -1312,9 +1316,13 @@ def spawn_chatgpt_subagent(task: str) -> dict[str, Any]:
     relative_task_dir = task_dir.relative_to(CONFIG.workspace_root).as_posix()
     normalized_input = f"{relative_task_dir}/input.md"
     normalized_output = f"{relative_task_dir}/output.md"
+    reservation_slot: int | None = None
     try:
         _write_text_atomic(task_dir / "input.md", task)
         _render_chatgpt_subagent_prompt(normalized_input, normalized_output)
+        from chatgpt_playwright import reserve_browser_slot
+
+        reservation_slot = reserve_browser_slot(task_id, task_dir)
     except BaseException:
         shutil.rmtree(task_dir, ignore_errors=True)
         raise
@@ -1322,24 +1330,35 @@ def spawn_chatgpt_subagent(task: str) -> dict[str, Any]:
     # The delegated runner owns the authoritative one-hour post-send completion
     # timeout. Give the outer background supervisor the full configured maximum so
     # browser-profile queueing/setup cannot consume that completion budget.
-    result = _start_workspace_task(
-        "python",
-        _chatgpt_subagent_task_code(normalized_input, normalized_output),
-        CONFIG.workspace_root,
-        ".",
-        CONFIG.max_background_timeout_seconds,
-        task_id=task_id,
-        task_dir=task_dir,
-        metadata={
-            "kind": "chatgpt_subagent",
-            "input_path": normalized_input,
-            "output_path": normalized_output,
-        },
-    )
+    assert reservation_slot is not None
+    try:
+        result = _start_workspace_task(
+            "python",
+            _chatgpt_subagent_task_code(
+                normalized_input, normalized_output, reservation_slot
+            ),
+            CONFIG.workspace_root,
+            ".",
+            CONFIG.max_background_timeout_seconds,
+            task_id=task_id,
+            task_dir=task_dir,
+            metadata={
+                "kind": "chatgpt_subagent",
+                "input_path": normalized_input,
+                "output_path": normalized_output,
+                "browser_slot": reservation_slot,
+            },
+        )
+    except BaseException:
+        from chatgpt_playwright import release_browser_slot
+
+        release_browser_slot(task_id, reservation_slot)
+        raise
     return {
         **result,
         "input_path": normalized_input,
         "output_path": normalized_output,
+        "browser_slot": reservation_slot,
         "completion": "task-owned output file creation plus final completion sentinel",
         "message": "Sub-agent queued; poll get_workspace_task with task_id.",
     }
