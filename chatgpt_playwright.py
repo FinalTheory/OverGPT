@@ -32,9 +32,8 @@ SEND_BUTTON_SELECTORS = (
 IGNORED_CHROME_DEFAULT_ARGS = ("--use-mock-keychain",)
 DEBUG_UI_HOLD_FILE = Path("/tmp/mymcp-debug-ui/hold-browser-open")
 DEBUG_UI_HOLD_SECONDS = 60
-SUBAGENT_STARTED_SENTINEL = "WRITERSUBAGENTSTARTED4C81E2B5"
 SUBAGENT_COMPLETED_SENTINEL = "WRITERSUBAGENTCOMPLETE7D3A9F6C"
-SUBAGENT_START_TIMEOUT_SECONDS = 300
+SUBAGENT_CREATION_TIMEOUT_SECONDS = 300
 BROWSER_TASK_CONCURRENCY = 10
 TASK_PROFILES_ROOT = Path(__file__).resolve().parent / "chatgpt-task-profiles"
 
@@ -141,7 +140,6 @@ def render_subagent_prompt(
     placeholders = {
         "{{INPUT_PATH}}": json.dumps(input_path, ensure_ascii=False),
         "{{OUTPUT_PATH}}": json.dumps(output_path, ensure_ascii=False),
-        "{{STARTED_SENTINEL}}": SUBAGENT_STARTED_SENTINEL,
         "{{COMPLETION_SENTINEL}}": SUBAGENT_COMPLETED_SENTINEL,
     }
     for placeholder, value in placeholders.items():
@@ -340,6 +338,23 @@ def _wait_for_file_completion(
     )
 
 
+def _wait_for_file_creation(
+    path: Path,
+    baseline: tuple[int, int, int] | None,
+    timeout_seconds: int,
+) -> float:
+    started = monotonic()
+    deadline = started + timeout_seconds
+    while monotonic() < deadline:
+        signature = _file_signature(path)
+        if signature is not None and signature != baseline:
+            return monotonic() - started
+        sleep(1)
+    raise TimeoutError(
+        f"output file was not created within {timeout_seconds} seconds: {path}"
+    )
+
+
 def send_prompt(
     prompt: str,
     *,
@@ -349,7 +364,7 @@ def send_prompt(
     headless: bool,
     timeout_seconds: int,
     verification_markers: tuple[str, ...],
-    started_wait: Callable[[], float] | None = None,
+    acknowledgement_wait: Callable[[], float] | None = None,
 ) -> dict[str, Any]:
     """Send one verified prompt with bounded retries only before Send."""
     if not prompt.strip():
@@ -423,10 +438,10 @@ def send_prompt(
                             "page_url": page.url,
                             "send_method": "button",
                         }
-                        if started_wait is not None:
+                        if acknowledgement_wait is not None:
                             try:
-                                result["started_wait_seconds"] = round(
-                                    started_wait(), 3
+                                result["acknowledgement_wait_seconds"] = round(
+                                    acknowledgement_wait(), 3
                                 )
                             except Exception as error:
                                 raise ChatGPTPostSendError(
@@ -591,16 +606,14 @@ def send_subagent_task(
         verification_markers=(
             normalized_input,
             normalized_output,
-            SUBAGENT_STARTED_SENTINEL,
             SUBAGENT_COMPLETED_SENTINEL,
         ),
-        started_wait=(
+        acknowledgement_wait=(
             (
-                lambda: _wait_for_file_completion(
+                lambda: _wait_for_file_creation(
                     output_file,
                     output_baseline,
-                    SUBAGENT_START_TIMEOUT_SECONDS,
-                    SUBAGENT_STARTED_SENTINEL,
+                    SUBAGENT_CREATION_TIMEOUT_SECONDS,
                 )
             )
             if output_file is not None

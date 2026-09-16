@@ -201,7 +201,7 @@ MCP_EXECUTION_HOME=
 
 `.env` 只保留机器路径、SSH/sync endpoint、端口、密码、显示名、容器 UID/GID、资源额度
 以及浏览器运行模式等部署差异。目录结构、协议路径、超时、大小限制、Git diff 策略和任务
-保留期等稳定策略只在 `config.py` 中定义；sub-agent 生命周期标记是
+保留期等稳定策略只在 `config.py` 中定义；sub-agent 的完成标记是
 `chatgpt_playwright.py` 中的固定协议常量。
 
 ## ChatGPT sub-agent automation
@@ -261,23 +261,22 @@ python chatgpt_playwright.py send \
 CLI 只验证它们是安全的 workspace 相对路径，在临时对话中输入提示词并点击官方发送
 按钮后打印 `sent`。它不要求本地存在远端文件，也不检测远端任务完成。
 
-MCP 后台任务使用两个固定标记区分“网页端已经开始执行”和“结果已经完成”：
+MCP 后台任务通过 `output.md` 的创建确认网页端已经开始执行，并用固定标记确认结果完成：
 
 ```text
-started sentinel:    WRITERSUBAGENTSTARTED4C81E2B5
 completion sentinel: WRITERSUBAGENTCOMPLETE7D3A9F6C
-start timeout:       300 seconds
+creation timeout:    300 seconds
 completion timeout:  3600 seconds
 ```
 
-网页端的第一项操作是创建 `output.md` 并写入 started sentinel。Playwright 检测到该标记后即可
-关闭页面；网页端随后用带 SHA-256 guard 的原子覆盖写入最终结果和 completion sentinel。默认
-远端 completion wait 为 1 小时，而且这个计时从 started acknowledgement 后开始。外层后台
-supervisor 使用更大的任务上限覆盖 browser queue/setup、started acknowledgement 和 completion
-三个阶段；若外层任务最终超时，整个受控 process group 会被终止并进入 `timed_out`。
+网页端的第一项操作是创建内容为空的 `output.md`。Playwright 检测到文件出现后即可关闭页面；
+网页端随后用带 SHA-256 guard 的原子覆盖写入最终结果和 completion sentinel。默认远端
+completion wait 为 1 小时，而且这个计时从文件创建 acknowledgement 后开始。外层后台
+supervisor 使用更大的任务上限覆盖 browser queue/setup、文件创建和 completion 三个阶段；
+若外层任务最终超时，整个受控 process group 会被终止并进入 `timed_out`。
 
 默认打开 `https://chatgpt.com/?temporary-chat=true`。脚本一次性填写提示词，并在点击
-发送前确认当前编辑器仍包含唯一的 input 路径、output 路径和两个生命周期标记；缺失时不会发送。
+发送前确认当前编辑器仍包含唯一的 input 路径、output 路径和完成标记；缺失时不会发送。
 
 通过 MCP 调用时，`spawn_chatgpt_subagent` 不阻塞等待结果，而是立即返回后台
 `task_id`。把这个 id 传给现有的 `get_workspace_task` 轮询：`queued` 或 `running` 表示
@@ -286,8 +285,8 @@ supervisor 使用更大的任务上限覆盖 browser queue/setup、started ackno
 
 登录 profile 是只读模板。每个浏览器任务先在短暂的跨进程锁内，把必要的登录状态复制到
 repo 内 `chatgpt-task-profiles/slot_00` 至 `slot_09` 的独立运行槽，再填写并验证 prompt、点击
-发送，并保持临时对话打开，直到 `output.md` 出现 started sentinel。随后会关闭 context、清空
-槽内 profile，并在后台等待 completion sentinel。固定槽把浏览器并发限制为 10，也限制了临时
+发送，并保持临时对话打开，直到 `output.md` 被创建。随后会关闭 context、清空槽内 profile，
+并在后台等待 completion sentinel。固定槽把浏览器并发限制为 10，也限制了临时
 profile 的最大数量；该目录被 Git、Docker build、rsync 和 Syncthing 忽略。多个 sub-agent 及
 递归委派不会并发写入持久登录 profile。`spawn_chatgpt_subagent` 会立即返回后台 task。ChatGPT
 DOM 变化或登录过期时，需要重新登录或更新 `chatgpt_playwright.py` 中的选择器。
@@ -342,4 +341,4 @@ make debug-ui
 make debug-ui-down
 ```
 
-正常模式会在 sub-agent 写回 started sentinel 后关闭浏览器；调试模式额外保留页面 60 秒。
+正常模式会在 sub-agent 创建 `output.md` 后关闭浏览器；调试模式额外保留页面 60 秒。

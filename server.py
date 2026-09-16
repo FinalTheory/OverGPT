@@ -1295,8 +1295,8 @@ def spawn_chatgpt_subagent(task: str) -> dict[str, Any]:
 
     The delegated input, authoritative output, execution logs, and lifecycle state
     all live under the returned task_dir. output.md is absent while queued, created
-    by the child with a fixed started marker, and atomically replaced by the final
-    result plus a fixed completion marker.
+    empty by the child to acknowledge execution, and atomically replaced by the
+    final result plus a fixed completion marker.
     """
     if not CONFIG.chatgpt_automation_enabled:
         raise RuntimeError(
@@ -1340,7 +1340,7 @@ def spawn_chatgpt_subagent(task: str) -> dict[str, Any]:
         **result,
         "input_path": normalized_input,
         "output_path": normalized_output,
-        "completion": "task-owned output file with started and completed sentinels",
+        "completion": "task-owned output file creation plus final completion sentinel",
         "message": "Sub-agent queued; poll get_workspace_task with task_id.",
     }
 

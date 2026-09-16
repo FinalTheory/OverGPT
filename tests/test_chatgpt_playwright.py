@@ -22,6 +22,7 @@ import chatgpt_playwright
 from chatgpt_playwright import (
     _browser_profile_lock,
     _wait_for_file_completion,
+    _wait_for_file_creation,
     send_prompt,
 )
 
@@ -94,14 +95,14 @@ def main() -> None:
                 headless=True,
                 timeout_seconds=10,
                 verification_markers=("browser marker",),
-                started_wait=lambda: _wait_for_file_completion(
-                    completion_file, None, 10, Handler.completion_sentinel
+                acknowledgement_wait=lambda: _wait_for_file_creation(
+                    completion_file, None, 10
                 ),
             )
             completion_detected = completion_file.read_text(encoding="utf-8").endswith(
                 Handler.completion_sentinel
             )
-            if "started_wait_seconds" not in result:
+            if "acknowledgement_wait_seconds" not in result:
                 raise RuntimeError("browser context did not wait for task acknowledgement")
     finally:
         server.shutdown()
