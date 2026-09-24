@@ -23,16 +23,125 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 sys.dont_write_bytecode = True
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import TextContent
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 
 from config import CONFIG
 
-mcp = FastMCP(
+_long_session_lock = threading.RLock()
+_long_session_started: dict[str, float] = {}
+_long_session_wakeups: dict[str, threading.Timer] = {}
+_long_session_wakeup_results: dict[str, dict[str, Any]] = {}
+
+
+def _validate_conversation_url(conversation_url: str) -> str:
+    normalized = conversation_url.strip()
+    parsed = urlparse(normalized)
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != "chatgpt.com"
+        or "/c/" not in parsed.path
+    ):
+        raise ValueError(
+            "conversation_url must be a specific https://chatgpt.com/.../c/... conversation URL"
+        )
+    return normalized
+
+
+def _long_session_status(conversation_url: str | None) -> dict[str, Any]:
+    if conversation_url is None:
+        return {
+            "tracked": False,
+            "should_yield": False,
+            "message": "No conversation_url supplied; long-session timing is not active.",
+        }
+    normalized = _validate_conversation_url(conversation_url)
+    with _long_session_lock:
+        started = _long_session_started.get(normalized)
+        last_wakeup = _long_session_wakeup_results.get(normalized)
+    if started is None:
+        return {
+            "tracked": False,
+            "conversation_url": normalized,
+            "should_yield": False,
+            **({"last_wakeup": dict(last_wakeup)} if last_wakeup is not None else {}),
+            "message": "No active timer for this conversation; call start_timer before long-running work.",
+        }
+    elapsed = max(0.0, time.monotonic() - started)
+    remaining = max(0.0, CONFIG.long_session_yield_after_seconds - elapsed)
+    should_yield = remaining <= 0
+    return {
+        "tracked": True,
+        "conversation_url": normalized,
+        "elapsed_seconds": round(elapsed, 3),
+        "remaining_seconds": round(remaining, 3),
+        "yield_after_seconds": CONFIG.long_session_yield_after_seconds,
+        "should_yield": should_yield,
+        **({"last_wakeup": dict(last_wakeup)} if last_wakeup is not None else {}),
+        "message": (
+            "Long-session threshold reached. Finish the current atomic step, persist progress, "
+            "then call register_wakeup and end this turn."
+            if should_yield
+            else "Long-session timer active."
+        ),
+    }
+
+
+class LongSessionFastMCP(FastMCP):
+    async def list_tools(self):
+        tools = await super().list_tools()
+        for tool in tools:
+            if tool.name in {"start_timer", "end_timer", "register_wakeup"}:
+                continue
+            properties = tool.inputSchema.setdefault("properties", {})
+            properties.setdefault(
+                "conversation_url",
+                {
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "default": None,
+                    "description": (
+                        "Optional current ChatGPT conversation URL. When supplied, the server "
+                        "returns authoritative long-session timing status for that conversation."
+                    ),
+                },
+            )
+        return tools
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]):
+        forwarded = dict(arguments)
+        control_tools = {"start_timer", "end_timer", "register_wakeup"}
+        conversation_url = (
+            forwarded.get("conversation_url")
+            if name in control_tools
+            else forwarded.pop("conversation_url", None)
+        )
+        if conversation_url is not None:
+            conversation_url = _validate_conversation_url(conversation_url)
+        result = await super().call_tool(name, forwarded)
+        if name in control_tools or conversation_url is None:
+            return result
+        status = _long_session_status(conversation_url)
+        lease = TextContent(
+            type="text",
+            text="LONG_SESSION_STATUS " + json.dumps(status, ensure_ascii=False, sort_keys=True),
+        )
+        if isinstance(result, tuple):
+            content, structured = result
+            if isinstance(structured, dict):
+                structured = {**structured, "long_session": status}
+            return ([*content, lease], structured)
+        if isinstance(result, list):
+            return [*result, lease]
+        return result
+
+
+mcp = LongSessionFastMCP(
     CONFIG.server_name,
     instructions=(
         f"This server exposes skills and a persistent shared workspace at {CONFIG.workspace_root}. "
@@ -50,12 +159,28 @@ mcp = FastMCP(
         "delete_workspace_file and move_workspace_file for ordinary file mutations instead of "
         "shell rm/mv. Use run_workspace_code(background=true) for "
         "long-running commands, then poll get_workspace_task with the returned task_id; background "
-        "commands default to a one-hour timeout. To delegate to a ChatGPT sub-agent, pass its "
-        "complete task directly to spawn_chatgpt_subagent. Preserve the separately returned "
+        "commands default to a one-hour timeout. Delegate ChatGPT sub-agents only through "
+        "spawn_chatgpt_subagents, passing a one-element list for a single task or multiple "
+        "independent tasks in one batch so partial capacity/start failures still "
+        "return every task ID that was already created. Preserve each separately returned "
         "output_path as the sub-agent's result file; stdout_path and stderr_path are execution "
         "logs. Call get_workspace_task with its defaults: it waits server-side for up to 30 "
         "seconds, returning sooner when the task finishes. If a task fails or times out, read "
-        "its returned stderr_path with the workspace file tools for diagnostics."
+        "its returned stderr_path with the workspace file tools for diagnostics. "
+        "Model execution time is bounded. If you know the URL of your current ChatGPT "
+        "conversation and expect to do substantial multi-step work, call start_timer with that "
+        "URL before beginning. Delegated temporary-chat sub-agents created by "
+        "spawn_chatgpt_subagents do not participate in this protocol unless they are explicitly "
+        "given their own existing conversation URL. Pass the same conversation_url on subsequent "
+        "MCP tool calls; the "
+        "server computes remaining time and appends authoritative LONG_SESSION_STATUS to every "
+        "ordinary tool result. When should_yield becomes true, do not start another large step: "
+        "finish the current atomic operation, persist/checkpoint enough state to continue safely, "
+        "then call register_wakeup with the same URL and end the current turn. register_wakeup "
+        "clears the active timer and schedules a continuation message to the same conversation "
+        f"after {CONFIG.long_session_wakeup_delay_seconds} seconds. When work finishes normally, "
+        "call end_timer. Never estimate the remaining execution budget yourself when server "
+        "timing is available."
     ),
     host=CONFIG.host,
     port=CONFIG.port,
@@ -65,6 +190,139 @@ mcp = FastMCP(
 )
 
 _workspace_write_lock = threading.RLock()
+
+_DEFAULT_WAKEUP_PROMPT = "Continue the previous task from where you stopped."
+
+
+def _send_registered_wakeup(conversation_url: str, prompt: str) -> None:
+    marker = f"LONG_SESSION_WAKEUP_{uuid.uuid4().hex}"
+    rendered_prompt = (
+        f"{marker}\n\n"
+        f"Conversation URL: {conversation_url}\n"
+        "Call start_timer with the conversation URL above before continuing MCP work.\n\n"
+        f"{prompt}"
+    )
+    with _long_session_lock:
+        _long_session_wakeup_results[conversation_url] = {
+            "status": "sending",
+            "marker": marker,
+            "started_at_epoch_seconds": time.time(),
+        }
+    try:
+        from chatgpt_playwright import send_prompt
+
+        result = send_prompt(
+            rendered_prompt,
+            url=conversation_url,
+            profile_dir=CONFIG.chatgpt_profile_dir,
+            browser_channel=CONFIG.chatgpt_browser_channel,
+            headless=CONFIG.chatgpt_browser_headless,
+            timeout_seconds=CONFIG.chatgpt_browser_timeout_seconds,
+            verification_markers=(marker,),
+            require_temporary_chat=False,
+        )
+    except Exception as exc:
+        with _long_session_lock:
+            _long_session_wakeup_results[conversation_url] = {
+                "status": "failed",
+                "marker": marker,
+                "finished_at_epoch_seconds": time.time(),
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+    else:
+        with _long_session_lock:
+            _long_session_wakeup_results[conversation_url] = {
+                "status": "sent",
+                "marker": marker,
+                "finished_at_epoch_seconds": time.time(),
+                "browser_result": result,
+            }
+    finally:
+        with _long_session_lock:
+            current = _long_session_wakeups.get(conversation_url)
+            if current is threading.current_thread():
+                _long_session_wakeups.pop(conversation_url, None)
+
+
+@mcp.tool()
+def start_timer(conversation_url: str) -> dict[str, Any]:
+    """Start or restart server-authoritative long-session timing for one ChatGPT conversation."""
+    normalized = _validate_conversation_url(conversation_url)
+    with _long_session_lock:
+        _long_session_started[normalized] = time.monotonic()
+        pending = _long_session_wakeups.pop(normalized, None)
+        if pending is not None:
+            pending.cancel()
+            _long_session_wakeup_results[normalized] = {
+                "status": "cancelled_by_start_timer",
+                "finished_at_epoch_seconds": time.time(),
+            }
+    return {
+        "status": "started",
+        **_long_session_status(normalized),
+    }
+
+
+@mcp.tool()
+def end_timer(conversation_url: str) -> dict[str, Any]:
+    """End long-session timing and cancel any pending wakeup for one conversation."""
+    normalized = _validate_conversation_url(conversation_url)
+    with _long_session_lock:
+        existed = _long_session_started.pop(normalized, None) is not None
+        pending = _long_session_wakeups.pop(normalized, None)
+        if pending is not None:
+            pending.cancel()
+            _long_session_wakeup_results[normalized] = {
+                "status": "cancelled_by_end_timer",
+                "finished_at_epoch_seconds": time.time(),
+            }
+    return {
+        "status": "ended",
+        "conversation_url": normalized,
+        "timer_existed": existed,
+        "wakeup_cancelled": pending is not None,
+    }
+
+
+@mcp.tool()
+def register_wakeup(
+    conversation_url: str,
+    prompt: str = _DEFAULT_WAKEUP_PROMPT,
+) -> dict[str, Any]:
+    """Clear the active timer and wake this ChatGPT conversation after the configured delay."""
+    normalized = _validate_conversation_url(conversation_url)
+    if not prompt.strip():
+        raise ValueError("prompt must not be empty")
+    with _long_session_lock:
+        timer_existed = _long_session_started.pop(normalized, None) is not None
+        previous = _long_session_wakeups.pop(normalized, None)
+        if previous is not None:
+            previous.cancel()
+        wakeup = threading.Timer(
+            CONFIG.long_session_wakeup_delay_seconds,
+            _send_registered_wakeup,
+            args=(normalized, prompt),
+        )
+        wakeup.daemon = True
+        _long_session_wakeups[normalized] = wakeup
+        _long_session_wakeup_results[normalized] = {
+            "status": "scheduled",
+            "scheduled_at_epoch_seconds": time.time(),
+            "delay_seconds": CONFIG.long_session_wakeup_delay_seconds,
+        }
+        wakeup.start()
+    return {
+        "status": "scheduled",
+        "conversation_url": normalized,
+        "delay_seconds": CONFIG.long_session_wakeup_delay_seconds,
+        "active_timer_cleared": timer_existed,
+        "previous_wakeup_replaced": previous is not None,
+        "message": (
+            "Wakeup registered. Finish the current response and stop working; the server will "
+            "send the continuation prompt after the configured delay."
+        ),
+    }
 
 
 def _workspace_path(relative_path: str, *, must_exist: bool = False) -> Path:
@@ -1292,26 +1550,22 @@ def apply_workspace_patch(patch: str) -> dict[str, Any]:
     return {"applied": True, "patch_chars": len(patch)}
 
 
-@mcp.tool()
-def spawn_chatgpt_subagent(task: str) -> dict[str, Any]:
-    """Asynchronously delegate one complete task to a new ChatGPT Web conversation.
-
-    The delegated input, authoritative output, execution logs, and lifecycle state
-    all live under the returned task_dir. output.md is absent while queued, created
-    empty by the child to acknowledge execution, and atomically replaced by the
-    final result plus a fixed completion marker. Browser capacity is reserved before
-    this tool returns; when all five slots are occupied, the call fails immediately.
-    """
+def _validate_chatgpt_subagent_task(task: str) -> None:
     if not CONFIG.chatgpt_automation_enabled:
         raise RuntimeError(
             "ChatGPT browser automation is disabled; set "
             "MCP_CHATGPT_AUTOMATION_ENABLED=true for the local MCP process"
         )
+    if not isinstance(task, str):
+        raise TypeError("task must be a string")
     if not task.strip():
         raise ValueError("task must not be empty")
     if len(task) > CONFIG.max_read_chars:
         raise ValueError(f"task exceeds the {CONFIG.max_read_chars} character limit")
 
+
+def _spawn_one_chatgpt_subagent(task: str) -> dict[str, Any]:
+    """Start one already-validated delegated browser task."""
     task_id, task_dir = _reserve_workspace_task_dir()
     relative_task_dir = task_dir.relative_to(CONFIG.workspace_root).as_posix()
     normalized_input = f"{relative_task_dir}/input.md"
@@ -1353,6 +1607,7 @@ def spawn_chatgpt_subagent(task: str) -> dict[str, Any]:
         from chatgpt_playwright import release_browser_slot
 
         release_browser_slot(task_id, reservation_slot)
+        shutil.rmtree(task_dir, ignore_errors=True)
         raise
     return {
         **result,
@@ -1361,6 +1616,106 @@ def spawn_chatgpt_subagent(task: str) -> dict[str, Any]:
         "browser_slot": reservation_slot,
         "completion": "task-owned output file creation plus final completion sentinel",
         "message": "Sub-agent queued; poll get_workspace_task with task_id.",
+    }
+
+
+@mcp.tool()
+def spawn_chatgpt_subagents(tasks: list[str]) -> dict[str, Any]:
+    """Safely start a bounded batch of independent ChatGPT Web sub-agents.
+
+    Every input is validated before any side effect. If a later item reaches browser
+    capacity after earlier items have already started, the tool returns all started
+    task IDs plus structured rejection state instead of aborting the whole call.
+    """
+    if not isinstance(tasks, list) or not tasks:
+        raise ValueError("tasks must be a non-empty list of task strings")
+
+    from chatgpt_playwright import BROWSER_TASK_CONCURRENCY, ChatGPTCapacityError
+
+    if len(tasks) > BROWSER_TASK_CONCURRENCY:
+        raise ValueError(
+            f"batch contains {len(tasks)} tasks but browser concurrency is "
+            f"{BROWSER_TASK_CONCURRENCY}"
+        )
+
+    # Validate the whole request before starting any task. A malformed later item
+    # must never leave earlier browser tasks running.
+    for task in tasks:
+        _validate_chatgpt_subagent_task(task)
+
+    items: list[dict[str, Any]] = []
+    started = 0
+    stop_reason: str | None = None
+
+    for index, task in enumerate(tasks):
+        if stop_reason is not None:
+            items.append(
+                {
+                    "index": index,
+                    "status": stop_reason,
+                    "task_id": None,
+                }
+            )
+            continue
+
+        try:
+            result = _spawn_one_chatgpt_subagent(task)
+        except ChatGPTCapacityError as exc:
+            items.append(
+                {
+                    "index": index,
+                    "status": "rejected_capacity",
+                    "task_id": None,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+            )
+            stop_reason = "not_started_capacity"
+            continue
+        except Exception as exc:
+            # Before any task starts, retain the existing loud failure behavior.
+            # After partial success, never throw away the only handles to already
+            # running tasks; return the start failure alongside those handles.
+            if started == 0:
+                raise
+            items.append(
+                {
+                    "index": index,
+                    "status": "failed_to_start",
+                    "task_id": None,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+            )
+            stop_reason = "not_started_after_error"
+            continue
+
+        started += 1
+        items.append(
+            {
+                **result,
+                "index": index,
+                "task_status": result.get("status"),
+                "status": "started",
+            }
+        )
+
+    if started == len(tasks):
+        batch_status = "all_started"
+    elif started == 0:
+        batch_status = "none_started"
+    else:
+        batch_status = "partial"
+
+    return {
+        "status": batch_status,
+        "requested": len(tasks),
+        "started": started,
+        "items": items,
+        "message": (
+            "Batch launch completed; preserve task_id/output_path from every "
+            "item whose status is started."
+        ),
     }
 
 

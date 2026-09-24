@@ -562,6 +562,16 @@ def main() -> None:
         if "[x].md" not in bracket_diff or "a.md" in bracket_diff or "b.md" in bracket_diff:
             raise RuntimeError(f"literal metacharacter filename diff leaked siblings: {bracket_diff}")
 
+        if hasattr(server, "spawn_chatgpt_subagent"):
+            raise RuntimeError("legacy single sub-agent API must not be exposed")
+        registered_tool_names = {
+            tool.name for tool in asyncio.run(server.mcp.list_tools())
+        }
+        if "spawn_chatgpt_subagent" in registered_tool_names:
+            raise RuntimeError("legacy single sub-agent MCP tool must not be registered")
+        if "spawn_chatgpt_subagents" not in registered_tool_names:
+            raise RuntimeError("batch sub-agent MCP tool is not registered")
+
         delegated_task = "THIS_CONTENT_MUST_NOT_BE_IN_THE_BROWSER_PROMPT"
         demo_task_id = "task_" + "d" * 32
         demo_task_dir = Path(workspace, ".mcp-tasks", demo_task_id).resolve()
@@ -587,7 +597,8 @@ def main() -> None:
                 return_value=2,
             ),
         ):
-            delegated = server.spawn_chatgpt_subagent(delegated_task)
+            single_batch = server.spawn_chatgpt_subagents([delegated_task])
+            delegated = single_batch["items"][0]
         task_code = mocked_start.call_args.args[1]
         if delegated_task in task_code:
             raise RuntimeError("input contents leaked into the browser prompt")
@@ -614,12 +625,16 @@ def main() -> None:
             raise RuntimeError("sub-agent output was pre-created instead of child-created")
         if not delegated["input_path"].startswith(f".mcp-tasks/{demo_task_id}/"):
             raise RuntimeError(f"sub-agent artifacts are not task-owned: {delegated}")
-        if delegated["status"] != "queued" or delegated["task_id"] != demo_task_id:
+        if (
+            delegated["status"] != "started"
+            or delegated["task_status"] != "queued"
+            or delegated["task_id"] != demo_task_id
+        ):
             raise RuntimeError(f"sub-agent was not queued asynchronously: {delegated}")
         if delegated["browser_slot"] != 2:
             raise RuntimeError(f"sub-agent did not return its reserved slot: {delegated}")
         try:
-            server.spawn_chatgpt_subagent("   ")
+            server.spawn_chatgpt_subagents(["   "])
         except ValueError:
             pass
         else:
@@ -642,14 +657,120 @@ def main() -> None:
                 ),
             ),
         ):
-            try:
-                server.spawn_chatgpt_subagent("capacity probe")
-            except chatgpt_playwright.ChatGPTCapacityError:
-                pass
-            else:
-                raise RuntimeError("full browser capacity did not reject sub-agent spawn")
+            full_batch = server.spawn_chatgpt_subagents(["capacity probe"])
+        if full_batch["status"] != "none_started":
+            raise RuntimeError(f"full capacity batch should start nothing: {full_batch}")
+        if full_batch["items"][0]["status"] != "rejected_capacity":
+            raise RuntimeError(f"full capacity batch did not report rejection: {full_batch}")
         if full_task_dir.exists():
             raise RuntimeError("rejected sub-agent left an unstarted task directory")
+
+        failed_start_task_id = "task_" + "f" * 32
+        failed_start_task_dir = Path(
+            workspace, ".mcp-tasks", failed_start_task_id
+        ).resolve()
+        failed_start_task_dir.mkdir()
+        with (
+            patch.object(
+                server,
+                "_reserve_workspace_task_dir",
+                return_value=(failed_start_task_id, failed_start_task_dir),
+            ),
+            patch.object(
+                chatgpt_playwright,
+                "reserve_browser_slot",
+                return_value=4,
+            ),
+            patch.object(
+                chatgpt_playwright,
+                "release_browser_slot",
+            ) as mocked_release,
+            patch.object(
+                server,
+                "_start_workspace_task",
+                side_effect=RuntimeError("simulated background start failure"),
+            ),
+        ):
+            try:
+                server.spawn_chatgpt_subagents(["background start failure probe"])
+            except RuntimeError:
+                pass
+            else:
+                raise RuntimeError("background start failure was silently accepted")
+        mocked_release.assert_called_once_with(failed_start_task_id, 4)
+        if failed_start_task_dir.exists():
+            raise RuntimeError("failed background start left an unowned task directory")
+
+        started_a = {
+            "task_id": "task_" + "a" * 32,
+            "status": "queued",
+            "output_path": ".mcp-tasks/task_a/output.md",
+        }
+        started_b = {
+            "task_id": "task_" + "b" * 32,
+            "status": "queued",
+            "output_path": ".mcp-tasks/task_b/output.md",
+        }
+        with patch.object(
+            server,
+            "_spawn_one_chatgpt_subagent",
+            side_effect=[
+                started_a,
+                started_b,
+                chatgpt_playwright.ChatGPTCapacityError(
+                    "ChatGPT browser capacity is full (5 concurrent tasks)"
+                ),
+            ],
+        ) as mocked_batch_spawn:
+            batch = server.spawn_chatgpt_subagents(
+                ["task a", "task b", "task c", "task d"]
+            )
+        if batch["status"] != "partial" or batch["started"] != 2:
+            raise RuntimeError(f"partial batch launch lost success state: {batch}")
+        statuses = [item["status"] for item in batch["items"]]
+        if statuses != [
+            "started",
+            "started",
+            "rejected_capacity",
+            "not_started_capacity",
+        ]:
+            raise RuntimeError(f"unexpected partial batch statuses: {batch}")
+        if [
+            batch["items"][0]["task_id"],
+            batch["items"][1]["task_id"],
+        ] != [started_a["task_id"], started_b["task_id"]]:
+            raise RuntimeError(f"partial batch lost started task IDs: {batch}")
+        if mocked_batch_spawn.call_count != 3:
+            raise RuntimeError(
+                "batch launch continued spawning after deterministic capacity rejection"
+            )
+
+        with patch.object(server, "_spawn_one_chatgpt_subagent") as mocked_invalid_batch:
+            try:
+                server.spawn_chatgpt_subagents(["valid first task", "   "])
+            except ValueError:
+                pass
+            else:
+                raise RuntimeError("batch accepted an invalid later task")
+        if mocked_invalid_batch.called:
+            raise RuntimeError("batch validation performed side effects before all inputs passed")
+
+        with patch.object(
+            server,
+            "_spawn_one_chatgpt_subagent",
+            side_effect=[started_a, RuntimeError("simulated launch failure")],
+        ):
+            failed_batch = server.spawn_chatgpt_subagents(
+                ["task a", "task b", "task c"]
+            )
+        if [item["status"] for item in failed_batch["items"]] != [
+            "started",
+            "failed_to_start",
+            "not_started_after_error",
+        ]:
+            raise RuntimeError(
+                f"partial runtime failure hid started task state: {failed_batch}"
+            )
 
         with (
             patch.object(

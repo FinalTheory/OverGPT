@@ -1,5 +1,6 @@
 services:
   mcp:
+    image: local/writer-base:latest
     build:
       context: .
       args:
@@ -38,6 +39,7 @@ services:
 
   browser-login:
     profiles: ["login"]
+    image: local/writer-base:latest
     build:
       context: .
       args:

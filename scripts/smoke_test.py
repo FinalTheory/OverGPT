@@ -97,7 +97,7 @@ async def main(url: str) -> None:
                 "cancel_workspace_task",
                 "restart_mcp_server",
                 "run_workspace_code",
-                "spawn_chatgpt_subagent",
+                "spawn_chatgpt_subagents",
             }
             if tool_names != expected_tools:
                 raise RuntimeError(

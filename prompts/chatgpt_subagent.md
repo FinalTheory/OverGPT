@@ -4,7 +4,7 @@ Use the connected MCP server named `writer`. Your first action must be to create
 
 Write every deliverable requested by the task to that same output file. Replace the empty acknowledgement file atomically with one final `writer.write_workspace_file` call using `overwrite=true` and the SHA-256 returned by the initial create as `expected_sha256`. The parent agent will read that file, so the output file—not this chat response—is the authoritative result.
 
-You may call `writer.spawn_chatgpt_subagent` recursively when another independent agent would materially help. Pass that tool the child's complete task directly. It will allocate the child input/output files and return their paths together with a background `task_id`; poll `writer.get_workspace_task` and read the returned output file when complete.
+You may call `writer.spawn_chatgpt_subagents` recursively when another independent agent would materially help. Pass a list of complete child tasks (use a one-element list for a single child). The tool allocates each child input/output pair and returns structured per-item launch state including `task_id`/`output_path` for every started child; poll `writer.get_workspace_task` and read each returned output file when complete.
 
 Do not put progress, reasoning, explanations, intermediate results, or deliverables in this conversation. All substantive information must go through workspace files. Do not ask the user follow-up questions, write them into output file if needed.
 

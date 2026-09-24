@@ -19,11 +19,13 @@ sys.dont_write_bytecode = True
 from urllib.parse import urlparse
 
 COMPOSER_SELECTORS = (
+    'div[contenteditable="true"][role="textbox"][data-composer-markdown]',
     '#prompt-textarea[contenteditable="true"]',
     '[contenteditable="true"][data-testid="composer-input"]',
 )
 SEND_BUTTON_SELECTORS = (
     'button[data-testid="send-button"]',
+    'button[type="submit"][aria-label="Send"]',
     'button[aria-label="Send prompt"]',
     'button[aria-label="Send message"]',
     'button[aria-label="发送提示"]',
@@ -394,16 +396,29 @@ def _fill_verified_prompt(
     markers: tuple[str, ...],
     timeout_ms: int,
 ) -> None:
-    """Fill the live editor and refuse to send if a page remount loses the prompt."""
+    """Fill a stable live editor, retrying safely across route hydration/remounts."""
     deadline = monotonic() + timeout_ms / 1000
     missing = list(markers)
-    for _ in range(3):
+    saw_composer = False
+    while monotonic() < deadline:
         remaining_ms = round((deadline - monotonic()) * 1000)
-        if remaining_ms <= 0:
-            break
-        composer = _find_composer(page, remaining_ms)
+        composer = _find_composer(page, min(1500, max(1, remaining_ms)))
         if composer is None:
-            break
+            page.wait_for_timeout(150)
+            continue
+        saw_composer = True
+
+        # Project/Gizmo routes may expose a transient composer before the canonical
+        # conversation route finishes hydrating. Never type into a node that is
+        # already being replaced.
+        handle = composer.element_handle()
+        page.wait_for_timeout(300)
+        try:
+            if handle is None or not handle.evaluate("(e) => e.isConnected"):
+                continue
+        except Exception:
+            continue
+
         composer.fill(prompt)
         page.wait_for_timeout(400)
         current = _find_composer(page, min(1000, max(1, remaining_ms)))
@@ -413,8 +428,14 @@ def _fill_verified_prompt(
         missing = [marker for marker in markers if marker not in text]
         if not missing:
             return
+        page.wait_for_timeout(150)
+
+    if not saw_composer:
+        raise ChatGPTPreSendError(
+            "ChatGPT composer did not become available before the send deadline"
+        )
     raise ChatGPTPreSendError(
-        "ChatGPT composer lost the delegated prompt before sending; "
+        "ChatGPT composer kept remounting or losing the delegated prompt before sending; "
         f"missing markers: {missing}"
     )
 
@@ -499,11 +520,12 @@ def send_prompt(
     acknowledgement_wait: Callable[[], float] | None = None,
     reservation_task_id: str | None = None,
     reservation_slot: int | None = None,
+    require_temporary_chat: bool = True,
 ) -> dict[str, Any]:
     """Send one verified prompt with bounded retries only before Send."""
     if not prompt.strip():
         raise ValueError("prompt must not be empty")
-    if not _is_temporary_chat_url(url):
+    if require_temporary_chat and not _is_temporary_chat_url(url):
         raise ValueError("ChatGPT automation requires a temporary-chat=true URL")
     if timeout_seconds < 1:
         raise ValueError("timeout_seconds must be positive")
@@ -550,7 +572,7 @@ def send_prompt(
                         page = context.pages[0] if context.pages else context.new_page()
                         page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
                         _fill_verified_prompt(page, prompt, verification_markers, timeout_ms)
-                        if not _is_temporary_chat_url(page.url):
+                        if require_temporary_chat and not _is_temporary_chat_url(page.url):
                             raise ChatGPTPreSendError(
                                 "ChatGPT left Temporary Chat before sending"
                             )

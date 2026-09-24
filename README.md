@@ -24,7 +24,7 @@
 - `run_workspace_code`：运行 Python 或 Shell；`background=true` 可启动持久化后台任务
 - `get_workspace_task`：服务端等待并查询后台任务状态，返回 stdout/stderr 文件路径
 - `cancel_workspace_task`：请求取消后台任务，并终止其整个命令进程组
-- `spawn_chatgpt_subagent`：接收完整任务，自动分配文件并异步委派给新的 ChatGPT 网页对话
+- `spawn_chatgpt_subagents`：唯一的 ChatGPT sub-agent 委派接口；传单元素列表启动一个任务，传多个任务批量启动。即使后续任务遇到 capacity/start failure，也会保留并返回已经成功创建的 task ID
 
 所有客户端路径都相对于共享目录，例如 `draft/demo.md`。服务会拒绝绝对路径和
 `../` 目录逃逸。
@@ -208,7 +208,7 @@ MCP_EXECUTION_HOME=
 
 这个接口默认关闭。Docker 镜像包含 Playwright Chromium；本地直接运行时则需要另行安装
 浏览器依赖。
-调用 `spawn_chatgpt_subagent` 时直接传入完整任务即可。每个 sub-agent 复用标准后台任务目录：
+调用 `spawn_chatgpt_subagents` 时传入任务列表；单任务也使用单元素列表。每个 sub-agent 复用标准后台任务目录：
 `.mcp-tasks/task_<uuid>/` 同时保存 `request.json`、`status.json`、stdout/stderr、`input.md`
 和最终的 `output.md`。`input.md` 在启动前创建，`output.md` 由 child 首次创建；任务正文不会
 复制进浏览器。新的 ChatGPT 对话会使用名为 `writer` 的 MCP 读取输入，并将全部结果写入
@@ -235,11 +235,15 @@ MCP_WORKSPACE_ROOT=/absolute/path/to/workspace
 
 ```json
 {
-  "task": "读取 draft/example.md，检查论证结构，并把修改建议写入结果文件。"
+  "tasks": [
+    "读取 draft/example.md，检查论证结构，并把修改建议写入结果文件。"
+  ]
 }
 ```
 
-接口立即返回标准后台任务信息，以及自动生成的 `input_path` 和 `output_path`。
+`spawn_chatgpt_subagents` 是唯一的 sub-agent 委派入口；不要让上层客户端在一个 RPC/Code Mode 调用里自行顺序组合多个底层 spawn。batch API 会先验证整个输入列表，然后逐项启动；若中途浏览器 capacity 已满，返回值会明确区分 `started`、`rejected_capacity` 和 `not_started_capacity`，并保留所有已启动任务的 `task_id` / `output_path`。这样不会出现“前几项已经启动，但最后一项异常导致整个上层调用只暴露失败”的状态丢失。
+
+接口立即返回 batch 状态和逐项结果；每个 `started` item 都包含标准后台任务信息，以及自动生成的 `input_path` 和 `output_path`。
 `input_path` 保存委派任务，`output_path` 是 subagent 的最终业务结果；`stdout_path` 和
 `stderr_path` 只保存 Playwright/后台执行日志，不能替代结果文件。随后用
 `get_workspace_task(task_id)` 查询状态，其异步状态、超时和日志机制与
@@ -278,7 +282,7 @@ supervisor 使用更大的任务上限覆盖 browser queue/setup、文件创建�
 默认打开 `https://chatgpt.com/?temporary-chat=true`。脚本一次性填写提示词，并在点击
 发送前确认当前编辑器仍包含唯一的 input 路径、output 路径和完成标记；缺失时不会发送。
 
-通过 MCP 调用时，`spawn_chatgpt_subagent` 不阻塞等待结果，而是立即返回后台
+通过 MCP 调用时，`spawn_chatgpt_subagents` 不阻塞等待结果，而是立即返回每个已启动的后台
 `task_id`。把这个 id 传给现有的 `get_workspace_task` 轮询：`queued` 或 `running` 表示
 仍在处理，`succeeded` 表示输出文件已经更新且检测到末尾标记；`failed` 或 `timed_out`
 表示没有正常完成。完整执行结果和临时页面 URL 保存在该任务的 stdout 日志中。
@@ -288,12 +292,10 @@ repo 内 `chatgpt-task-profiles/slot_00` 至 `slot_04` 的独立运行槽，再�
 发送，并保持临时对话打开，直到 `output.md` 被创建。随后会关闭 context、清空槽内 profile，
 并在后台等待 completion sentinel。固定槽把浏览器并发限制为 5，也限制了临时
 profile 的最大数量；该目录被 Git、Docker build、rsync 和 Syncthing 忽略。多个 sub-agent 及
-递归委派不会并发写入持久登录 profile。`spawn_chatgpt_subagent` 会立即返回后台 task。ChatGPT
+递归委派不会并发写入持久登录 profile。`spawn_chatgpt_subagents` 会立即返回已启动的后台 task。ChatGPT
 DOM 变化或登录过期时，需要重新登录或更新 `chatgpt_playwright.py` 中的选择器。
 
-`spawn_chatgpt_subagent` 会在接受任务前原子预留一个浏览器槽。五个槽都被占用或预留时，
-工具调用直接返回 capacity error，不创建后台排队任务；调用方应等待已有任务创建其
-`output.md`、释放浏览器槽后再决定是否发起新的委派。
+`spawn_chatgpt_subagents` 会为每个待启动任务在接受前原子预留一个浏览器槽。若批次执行到某一项时五个槽都已被占用或预留，该项返回 `rejected_capacity`，后续未尝试项返回 `not_started_capacity`；整个 batch 仍正常返回，并保留此前所有 `started` 项的 `task_id` / `output_path`。调用方可等待已有任务释放浏览器槽后，再对未启动项发起新的 batch。
 
 ### VPS browser login
 
@@ -336,7 +338,7 @@ make debug-ui
 ```
 
 `debug-ui` 只在 Mac 建立到本地 `6081` 的 SSH tunnel 并自动打开页面，不会在 VPS 执行
-任何命令。它观察的是实际执行 `spawn_chatgpt_subagent` 的 Xvfb，而不是会争用 profile 的
+任何命令。它观察的是实际执行 `spawn_chatgpt_subagents` 所启动浏览器任务的 Xvfb，而不是会争用 profile 的
 登录容器。连接完成后再触发一个 sub-agent；调试模式会在点击发送后保留浏览器 60 秒，
 方便确认 ChatGPT 是否调用了 `writer` 工具。按 `Ctrl+C` 只关闭本地 tunnel。调试完成后，
 在 VPS 项目目录运行：

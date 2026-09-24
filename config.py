@@ -74,6 +74,8 @@ class Config:
     task_retention_days: int = 30
     execution_home: str = os.getenv("MCP_EXECUTION_HOME", "")
     restart_delay_seconds: float = 2.0
+    long_session_yield_after_seconds: int = 20 * 60
+    long_session_wakeup_delay_seconds: int = 2 * 60
 
     chatgpt_automation_enabled: bool = _env_bool(
         "MCP_CHATGPT_AUTOMATION_ENABLED", False
