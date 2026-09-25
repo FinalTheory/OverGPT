@@ -4,48 +4,72 @@
 
 [English](README.md) · [中文](README.zh-CN.md)
 
-GPTOvertime extends ChatGPT's MCP execution model beyond a single bounded turn.
+GPTOvertime is a companion to [WebCodex](https://github.com/yyjeqhc/webcodex). WebCodex gives ChatGPT a real development environment; GPTOvertime lets the ChatGPT side keep working beyond one model turn and delegate work to fresh ChatGPT sub-agents.
 
-A capable ChatGPT session can already inspect repositories, edit files, run commands, and use arbitrary MCP tools. The remaining constraint is execution lifetime: a sufficiently large task may outlive one model turn, and complex work often benefits from delegating independent reasoning to fresh contexts.
+## Why this exists
 
-GPTOvertime adds those capabilities as an MCP-side execution layer:
+OpenAI Codex already provides a strong coding-agent experience, but Codex has its own plan usage allowance. Local Codex messages and cloud tasks share that allowance.
 
-- **Continuation across turns** — checkpoint work near the end of a model execution window and automatically wake the same ChatGPT conversation to continue.
-- **Recursive sub-agents** — delegate independent tasks to fresh ChatGPT conversations, persist their outputs, and allow those agents to delegate again.
-- **Durable execution state** — keep background task metadata, outputs, and logs outside the lifetime of a single MCP request.
+[WebCodex](https://github.com/yyjeqhc/webcodex) takes a different path: it exposes your real development environment through MCP, so an ordinary ChatGPT conversation can inspect repositories, edit files, use Git, run tests, and execute developer tools on your own machine.
 
-## Why GPTOvertime
+That means you can use ChatGPT itself as the coding agent instead of routing every coding task through Codex. The work is governed by the limits of the ChatGPT conversation and model you are using, rather than consuming the separate Codex usage allowance.
 
-The useful unit of work for an agent is often larger than one model turn.
+This does not make usage unlimited or bypass ChatGPT limits. It simply lets WebCodex users use the ChatGPT + MCP execution path for development work.
 
-A repository migration, research pass, test-and-fix loop, or multi-agent audit can require many tool calls and may need several independent contexts. Without an external execution layer, the parent conversation has to finish before its execution budget expires, and delegated work is difficult to supervise reliably.
+WebCodex already solves the environment side very well:
 
-GPTOvertime treats a ChatGPT turn as one slice of a longer logical task.
+- repository access
+- safe file editing
+- Git
+- shell commands and tests
+- real local toolchains
+- durable long-running machine jobs
+
+Two model-side problems remain.
+
+First, a ChatGPT execution turn is still bounded. A large task may need more reasoning and tool calls than one turn can finish.
+
+Second, one conversation is not always the best context for every part of a complex task. Independent review, verification, research, or alternative implementations often work better in fresh contexts.
+
+GPTOvertime fills those two gaps.
+
+## How GPTOvertime fits with WebCodex
+
+Conceptually, WebCodex is the **development environment** and GPTOvertime is the **execution control layer** around the ChatGPT side.
 
 ```text
-logical task
-    │
-    ├── ChatGPT turn
-    │      ├── MCP work
-    │      ├── durable background tasks
-    │      └── spawn sub-agents
-    │
-    ├── checkpoint
-    │
-    ├── automatic continuation
-    │
-    └── next ChatGPT turn
+                         ChatGPT
+                            │
+              ┌─────────────┴─────────────┐
+              │                           │
+              ▼                           ▼
+         GPTOvertime                  WebCodex
+      execution control            development tools
+              │                           │
+      ┌───────┼────────┐                  ▼
+      │       │        │              your machine
+ continue  delegate  supervise            │
+      │       │        │          ┌────────┼────────┐
+      │       │        │          │        │        │
+      │       │        │        repo      Git    tests/tools
+      │       │        │
+      │       ▼        │
+      │   fresh ChatGPT sub-agents
+      │       │
+      └───────┴─── use the same MCP environment
 ```
 
-The logical task can therefore continue even when any individual model turn must stop.
+A WebCodex user can therefore keep the same repository, Git checkout, tests, and local tools. GPTOvertime adds longer-lived ChatGPT execution and recursive delegation on top of that workflow.
 
-## Long-running conversations
+GPTOvertime is not a replacement for WebCodex. The two projects solve different layers of the same problem.
 
-GPTOvertime maintains a server-authoritative execution timer for a ChatGPT conversation.
+## Continue beyond one ChatGPT turn
 
-While a long session is active, ordinary MCP tool results include the remaining execution budget. When the configured yield threshold is reached, the model can finish its current atomic step, persist enough state to resume safely, and register a wake-up.
+GPTOvertime keeps server-authoritative timing for a ChatGPT conversation.
 
-GPTOvertime then sends a continuation message back to the same conversation after a short delay.
+While a long session is active, MCP tool results include the remaining execution budget. When the current turn is near its limit, ChatGPT can finish the current atomic step, persist enough state to resume safely, and register a wake-up.
+
+GPTOvertime then sends a continuation message back to the same conversation.
 
 ```text
 start
@@ -65,15 +89,15 @@ work ──► work ──► work
         same conversation resumes
 ```
 
-The continuation protocol is explicit: timing comes from the server, progress is persisted before yielding, and the next turn resumes the existing task rather than reconstructing it from an implicit in-memory loop.
+The important part is that continuation is explicit. Timing comes from the server, progress is saved before yielding, and the next turn resumes the existing task.
 
-## Recursive ChatGPT sub-agents
+A long logical task can therefore span multiple ChatGPT turns without pretending that one model invocation can run forever.
+
+## Spawn fresh recursive sub-agents
 
 GPTOvertime can launch fresh ChatGPT conversations as isolated workers.
 
-Each delegated task receives its own persistent input and output files, background task state, and browser execution slot. The parent receives a task identifier immediately and can continue working while the child runs independently.
-
-A child can use the same MCP server and recursively delegate further work when useful.
+Each delegated task gets explicit input, persistent output, task state, and its own browser execution slot. The parent receives a task ID immediately and can keep working while the child runs independently.
 
 ```text
                     parent ChatGPT
@@ -85,71 +109,34 @@ A child can use the same MCP server and recursively delegate further work when u
         sub-agent A               sub-agent B
               │                       │
         durable output           durable output
-              │
+              │                       │
               └───────────┬───────────┘
                           ▼
                     parent consumes
                        results
 ```
 
-This is useful when work benefits from clean context boundaries: independent code review, adversarial verification, parallel research, alternative designs, or any task where one context should not inherit the parent's entire reasoning history.
+A sub-agent can use the same mechanism again, so delegation can be recursive.
 
-Sub-agents use the same mechanism recursively, so delegation forms a bounded execution tree instead of a one-level helper call.
+Fresh contexts are useful for work such as independent code review, adversarial verification, parallel research, or exploring alternative implementations without carrying the parent's full conversation history into every branch.
 
-## Durable task execution
+## Durable execution state
 
-Long-running shell or Python work is represented as persistent background tasks instead of long-lived MCP requests.
+GPTOvertime keeps task handoff and completion state outside any single model turn.
 
-Task state and logs are written to the shared workspace, with explicit lifecycle states such as `queued`, `running`, `succeeded`, `failed`, `timed_out`, and `cancelled`. Execution remains observable across normal client disconnects and MCP request boundaries.
+Sub-agent inputs and outputs are persisted in the shared workspace. Background work has explicit states such as `queued`, `running`, `succeeded`, `failed`, `timed_out`, and `cancelled`.
 
-The same task abstraction is used by ChatGPT sub-agents, so delegated model work and ordinary background computation share one supervision model.
+This gives the parent conversation a concrete way to supervise delegated work instead of relying on hidden in-memory orchestration.
 
-## Where it fits
-
-GPTOvertime is intentionally narrow.
-
-It does not try to replace a repository agent, coding harness, or general-purpose MCP environment. Existing tools can already give ChatGPT access to files, Git, shells, tests, browsers, databases, and external services.
-
-GPTOvertime adds an execution layer around that environment:
-
-```text
-                         ChatGPT
-                            │
-                            │ MCP
-                            ▼
-                      GPTOvertime
-                ┌───────────┼───────────┐
-                │           │           │
-          continuation   durable     recursive
-                         tasks       sub-agents
-                │           │           │
-                └───────────┴───────────┘
-                            │
-                            ▼
-                workspace / repo / tools
-```
-
-The result is a ChatGPT session that can keep working for longer, hand off independent work to clean contexts, and recover results through explicit durable state.
-
-## Design principles
-
-**Durable state over hidden orchestration.** Inputs, outputs, task status, and checkpoints live in the shared workspace whenever practical.
-
-**Explicit lifecycle over best-effort prompting.** Continuation, timeout, cancellation, capacity, and completion are represented as protocol state rather than inferred from chat text.
-
-**Clean delegation boundaries.** Sub-agents start from explicit task inputs and return explicit outputs instead of inheriting an opaque parent context.
-
-**Bounded recursion and concurrency.** Delegation is recursive, but execution remains supervised by finite task and browser capacity.
-
-**MCP-native composition.** GPTOvertime is designed to sit beside existing MCP capabilities rather than absorb every tool into a new agent framework.
+WebCodex can continue to own repository execution and long-running developer jobs. GPTOvertime uses durable state for the model-side lifecycle: continuation, delegation, supervision, and result collection.
 
 ## Current implementation
 
 The current implementation targets ChatGPT with MCP access.
 
-Conversation continuation and sub-agent spawning use authenticated ChatGPT Web sessions driven through Playwright. Persistent workspace files provide task handoff and result collection, while the MCP server provides timing, task supervision, workspace operations, and background execution.
+Conversation continuation and sub-agent spawning use authenticated ChatGPT Web sessions driven through Playwright. Persistent workspace files provide task handoff and result collection. The MCP server provides timing, task supervision, and the control primitives needed to continue or delegate work.
 
-The implementation is intentionally separable from the core idea: the durable continuation and delegation model does not depend on a particular repository tool or coding-agent harness.
+GPTOvertime can run with its own workspace tools, but it is designed to complement WebCodex. For software-engineering use, WebCodex provides the richer repository and developer-tool layer while GPTOvertime focuses on keeping ChatGPT working across turns and splitting independent work into fresh conversations.
 
 ---
 
