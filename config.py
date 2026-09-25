@@ -121,9 +121,4 @@ class Config:
         except ValueError as error:
             raise RuntimeError("runtime task_state directory must stay inside workspace_root") from error
 
-    @property
-    def long_session_event_log(self) -> Path:
-        return self.logs_root / "long-session-events.jsonl"
-
-
 CONFIG = Config()

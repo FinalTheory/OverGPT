@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import tempfile
 import time
 import unittest
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -55,7 +55,11 @@ class LongSessionTests(unittest.TestCase):
         self._config_patch = patch.object(
             server,
             "CONFIG",
-            replace(server.CONFIG, project_root=Path(self._log_temp.name)),
+            replace(
+                server.CONFIG,
+                project_root=Path(self._log_temp.name),
+                runtime_root=Path(self._log_temp.name),
+            ),
         )
         self._config_patch.start()
         self._reset_long_session_state()
@@ -67,8 +71,10 @@ class LongSessionTests(unittest.TestCase):
 
     def test_all_ordinary_tools_accept_optional_conversation_url(self) -> None:
         tools = asyncio.run(server.mcp.list_tools())
-        controls = {"start_timer", "end_timer", "register_wakeup", "list_long_sessions"}
-        self.assertTrue(controls.issubset({tool.name for tool in tools}))
+        controls = {"start_timer", "end_timer", "register_wakeup"}
+        tool_names = {tool.name for tool in tools}
+        self.assertTrue(controls.issubset(tool_names))
+        self.assertNotIn("list_long_sessions", tool_names)
         for tool in tools:
             if tool.name in controls:
                 continue
@@ -105,53 +111,6 @@ class LongSessionTests(unittest.TestCase):
         expired = server._long_session_status(url)
         self.assertTrue(expired["timed_out"])
         self.assertEqual(expired["remaining_seconds"], 0.0)
-
-    def test_list_long_sessions_reports_active_timer_and_pending_wakeup(self) -> None:
-        timer_url = "https://chatgpt.com/c/debug-active"
-        wakeup_url = "https://chatgpt.com/c/debug-wakeup"
-
-        server.start_timer(timer_url)
-        with server._long_session_lock:
-            server._long_session_started[timer_url] = (
-                time.monotonic() - server.CONFIG.long_session_yield_after_seconds - 1
-            )
-
-        with patch.object(server.threading, "Timer", FakeTimer):
-            server.register_wakeup(wakeup_url, prompt="continue")
-
-        snapshot = server.list_long_sessions()
-        self.assertEqual(snapshot["status"], "ok")
-        self.assertEqual(snapshot["count"], 2)
-        self.assertEqual(snapshot["active_timer_count"], 1)
-        self.assertEqual(snapshot["pending_wakeup_count"], 1)
-
-        by_url = {
-            session["conversation_url"]: session for session in snapshot["sessions"]
-        }
-        active = by_url[timer_url]
-        self.assertEqual(active["phase"], "timer_active")
-        self.assertTrue(active["timer"]["active"])
-        self.assertTrue(active["timer"]["timed_out"])
-        self.assertEqual(active["timer"]["remaining_seconds"], 0.0)
-        self.assertFalse(active["wakeup"]["pending"])
-
-        pending = by_url[wakeup_url]
-        self.assertEqual(pending["phase"], "wakeup_scheduled")
-        self.assertFalse(pending["timer"]["active"])
-        self.assertTrue(pending["wakeup"]["pending"])
-        self.assertIn("due_at_epoch_seconds", pending["wakeup"])
-        self.assertGreaterEqual(pending["wakeup"]["remaining_seconds"], 0.0)
-
-    def test_list_long_sessions_excludes_historical_wakeup_only_state(self) -> None:
-        url = "https://chatgpt.com/c/debug-history"
-        with server._long_session_lock:
-            server._long_session_wakeup_results[url] = {
-                "status": "sent",
-                "finished_at_epoch_seconds": time.time(),
-            }
-        snapshot = server.list_long_sessions()
-        self.assertEqual(snapshot["count"], 0)
-        self.assertEqual(snapshot["sessions"], [])
 
     def test_ordinary_tool_returns_lease_in_text_and_structured_output(self) -> None:
         url = "https://chatgpt.com/c/result-test"
@@ -285,15 +244,12 @@ class LongSessionTests(unittest.TestCase):
 
         self.assertEqual(len(FakeTimer.created), 1)
         self.assertTrue(FakeTimer.created[0].started)
-        snapshot = server.list_long_sessions()
-        session = next(
-            item for item in snapshot["sessions"]
-            if item["conversation_url"] == url
-        )
-        self.assertEqual(session["phase"], "timed_out_fallback_scheduled")
-        self.assertTrue(session["timer"]["timed_out"])
-        self.assertTrue(session["wakeup"]["pending"])
-        self.assertEqual(session["wakeup"]["kind"], "timeout_fallback")
+        self.assertTrue(server._long_session_status(url)["timed_out"])
+        with server._long_session_lock:
+            self.assertIn(url, server._long_session_wakeups)
+            self.assertEqual(
+                server._long_session_wakeup_results[url]["kind"], "timeout_fallback"
+            )
 
     def test_agent_registered_wakeup_replaces_timeout_fallback(self) -> None:
         url = "https://chatgpt.com/c/control-after-timeout"
@@ -394,8 +350,9 @@ class LongSessionTests(unittest.TestCase):
                 )
                 server.register_wakeup(url, prompt="continue")
 
-                log_path = test_config.long_session_event_log
+                log_path = server._long_session_log_path(url)
                 self.assertTrue(log_path.is_file())
+                self.assertEqual(log_path.name, "persistent-trace.jsonl")
                 events = [
                     json.loads(line)
                     for line in log_path.read_text(encoding="utf-8").splitlines()
@@ -415,33 +372,26 @@ class LongSessionTests(unittest.TestCase):
         )
         self.assertTrue(all(event["conversation_url"] == url for event in events))
         self.assertTrue(all("epoch_seconds" not in event for event in events))
+        self.assertTrue(all("elapsed_seconds" not in event for event in events))
 
-    def test_long_session_event_log_retains_only_recent_three_days(self) -> None:
+    def test_long_session_logs_retain_only_recent_three_days(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             test_config = replace(server.CONFIG, runtime_root=Path(temp_dir))
-            log_path = test_config.long_session_event_log
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            old_timestamp = (datetime.now(UTC) - timedelta(days=4)).isoformat()
-            recent_timestamp = (datetime.now(UTC) - timedelta(days=1)).isoformat()
-            log_path.write_text(
-                "\n".join(
-                    [
-                        json.dumps({"timestamp": old_timestamp, "event": "old"}),
-                        json.dumps({"timestamp": recent_timestamp, "event": "recent"}),
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
-            )
+            test_config.logs_root.mkdir(parents=True, exist_ok=True)
+            old_log = test_config.logs_root / "old-session.jsonl"
+            recent_log = test_config.logs_root / "recent-session.jsonl"
+            old_log.write_text("old\n", encoding="utf-8")
+            recent_log.write_text("recent\n", encoding="utf-8")
+            now = time.time()
+            old_mtime = now - 4 * 24 * 60 * 60
+            recent_mtime = now - 1 * 24 * 60 * 60
+            os.utime(old_log, (old_mtime, old_mtime))
+            os.utime(recent_log, (recent_mtime, recent_mtime))
             with patch.object(server, "CONFIG", test_config):
-                removed = server._prune_long_session_event_log(force=True)
+                removed = server._prune_long_session_logs(force=True)
             self.assertEqual(removed, 1)
-            events = [
-                json.loads(line)
-                for line in log_path.read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            ]
-            self.assertEqual([event["event"] for event in events], ["recent"])
+            self.assertFalse(old_log.exists())
+            self.assertTrue(recent_log.exists())
 
     def test_ordinary_tool_without_url_is_unmodified_for_clean_subagents(self) -> None:
         result = asyncio.run(
@@ -494,6 +444,127 @@ class LongSessionTests(unittest.TestCase):
         )
         self.assertTrue(wakeup.started)
         self.assertEqual(wakeup.args, (url, "continue exactly"))
+
+    def test_wakeup_pre_send_exhaustion_schedules_long_retries(self) -> None:
+        url = "https://chatgpt.com/c/long-retry-test"
+        expected_delays = server._WAKEUP_LONG_RETRY_DELAYS_SECONDS
+
+        with (
+            patch.object(server.threading, "Timer", FakeTimer),
+            patch.object(
+                chatgpt_playwright,
+                "send_prompt",
+                side_effect=chatgpt_playwright.ChatGPTPreSendError(
+                    "ChatGPT pre-send automation failed after 3 attempts"
+                ),
+            ),
+        ):
+            # Initial wake-up exhausted its three short retries.
+            server._send_registered_wakeup(url, "continue work")
+            self.assertEqual(len(FakeTimer.created), 1)
+            self.assertEqual(FakeTimer.created[-1].interval, expected_delays[0])
+            self.assertEqual(
+                server._long_session_wakeup_results[url]["status"],
+                "retry_scheduled",
+            )
+            self.assertEqual(
+                server._long_session_wakeup_results[url]["retry_number"], 1
+            )
+
+            # Each long retry again represents one full send_prompt transaction,
+            # which itself contains the existing three short retries.
+            for retry_number in range(1, len(expected_delays)):
+                with server._long_session_lock:
+                    server._long_session_wakeups.pop(url, None)
+                server._send_registered_wakeup(
+                    url, "continue work", long_retry_number=retry_number
+                )
+                self.assertEqual(len(FakeTimer.created), retry_number + 1)
+                self.assertEqual(
+                    FakeTimer.created[-1].interval,
+                    expected_delays[retry_number],
+                )
+                self.assertEqual(
+                    server._long_session_wakeup_results[url]["retry_number"],
+                    retry_number + 1,
+                )
+
+            # The one-hour retry is the final retry. If its three short attempts
+            # also fail, the wake-up becomes terminally failed.
+            with server._long_session_lock:
+                server._long_session_wakeups.pop(url, None)
+            server._send_registered_wakeup(
+                url,
+                "continue work",
+                long_retry_number=len(expected_delays),
+            )
+
+        self.assertEqual(len(FakeTimer.created), len(expected_delays))
+        result = server._long_session_wakeup_results[url]
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["retry_number"], len(expected_delays))
+
+        log_path = server._long_session_log_path(url)
+        events = [
+            json.loads(line)
+            for line in log_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        scheduled = [
+            event
+            for event in events
+            if event["event"] == "wakeup_long_retry_scheduled"
+        ]
+        started = [
+            event
+            for event in events
+            if event["event"] == "wakeup_long_retry_started"
+        ]
+        exhausted = [
+            event
+            for event in events
+            if event["event"] == "wakeup_short_retries_exhausted"
+        ]
+        self.assertEqual(
+            [event["delay_seconds"] for event in scheduled],
+            list(expected_delays),
+        )
+        self.assertEqual(
+            [event["retry_number"] for event in started],
+            list(range(1, len(expected_delays) + 1)),
+        )
+        self.assertEqual(len(exhausted), len(expected_delays) + 1)
+        self.assertTrue(events[-1]["long_retries_exhausted"])
+        self.assertEqual(events[-1]["event"], "wakeup_failed")
+
+    def test_successful_long_retry_stops_retry_chain(self) -> None:
+        url = "https://chatgpt.com/c/long-retry-success"
+        with patch.object(
+            chatgpt_playwright,
+            "send_prompt",
+            return_value={"status": "sent"},
+        ):
+            server._send_registered_wakeup(
+                url, "continue work", long_retry_number=2
+            )
+
+        self.assertEqual(
+            server._long_session_wakeup_results[url]["status"], "sent"
+        )
+        self.assertEqual(
+            server._long_session_wakeup_results[url]["retry_number"], 2
+        )
+        events = [
+            json.loads(line)
+            for line in server._long_session_log_path(url)
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(
+            [event["event"] for event in events],
+            ["wakeup_long_retry_started", "wakeup_sending", "wakeup_sent"],
+        )
 
     def test_failed_wakeup_is_retained_for_diagnostics(self) -> None:
         url = "https://chatgpt.com/c/failure-test"

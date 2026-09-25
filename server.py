@@ -38,53 +38,46 @@ _long_session_lock = threading.RLock()
 _long_session_started: dict[str, float] = {}
 _long_session_wakeups: dict[str, threading.Timer] = {}
 _long_session_wakeup_results: dict[str, dict[str, Any]] = {}
-_long_session_event_log_lock = threading.RLock()
-_long_session_event_log_last_pruned_monotonic = 0.0
+_long_session_log_lock = threading.RLock()
+_long_session_log_last_pruned_monotonic = 0.0
 
 
-def _prune_long_session_event_log(*, force: bool = False) -> int:
-    """Drop lifecycle events older than the configured retention window in place."""
-    global _long_session_event_log_last_pruned_monotonic
+def _long_session_log_path(conversation_url: str) -> Path:
+    """Return the per-conversation lifecycle log path."""
+    normalized = _validate_conversation_url(conversation_url)
+    conversation_id = urlparse(normalized).path.rstrip("/").rsplit("/", 1)[-1]
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", conversation_id):
+        raise ValueError("conversation URL has an invalid final path component")
+    return CONFIG.logs_root / f"{conversation_id}.jsonl"
+
+
+def _prune_long_session_logs(*, force: bool = False) -> int:
+    """Delete per-conversation lifecycle logs older than the retention window."""
+    global _long_session_log_last_pruned_monotonic
 
     now_monotonic = time.monotonic()
     if (
         not force
-        and now_monotonic - _long_session_event_log_last_pruned_monotonic
+        and now_monotonic - _long_session_log_last_pruned_monotonic
         < CONFIG.long_session_log_prune_interval_seconds
     ):
         return 0
-    _long_session_event_log_last_pruned_monotonic = now_monotonic
+    _long_session_log_last_pruned_monotonic = now_monotonic
 
-    path = CONFIG.long_session_event_log
-    if not path.is_file():
+    if not CONFIG.logs_root.is_dir():
         return 0
-    cutoff = datetime.now(UTC) - timedelta(days=CONFIG.long_session_log_retention_days)
-    kept: list[str] = []
+    cutoff = time.time() - CONFIG.long_session_log_retention_days * 24 * 60 * 60
     removed = 0
-    with path.open("r+", encoding="utf-8") as handle:
-        for line in handle:
-            stripped = line.strip()
-            if not stripped:
-                kept.append(line)
+    for path in CONFIG.logs_root.iterdir():
+        if path.is_symlink() or not path.is_file() or path.suffix != ".jsonl":
+            continue
+        try:
+            if path.stat().st_mtime >= cutoff:
                 continue
-            try:
-                record = json.loads(stripped)
-                timestamp = datetime.fromisoformat(str(record["timestamp"]))
-                if timestamp.tzinfo is None:
-                    timestamp = timestamp.replace(tzinfo=UTC)
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                # Preserve malformed/legacy lines rather than deleting forensic data.
-                kept.append(line)
-                continue
-            if timestamp.astimezone(UTC) < cutoff:
-                removed += 1
-            else:
-                kept.append(line)
-        if removed:
-            handle.seek(0)
-            handle.writelines(kept)
-            handle.truncate()
-            handle.flush()
+            path.unlink()
+            removed += 1
+        except OSError:
+            continue
     return removed
 
 
@@ -101,11 +94,12 @@ def _append_long_session_event(
         **fields,
     }
     try:
-        CONFIG.long_session_event_log.parent.mkdir(parents=True, exist_ok=True)
+        log_path = _long_session_log_path(conversation_url)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(record, ensure_ascii=False, sort_keys=True)
-        with _long_session_event_log_lock:
-            _prune_long_session_event_log()
-            with CONFIG.long_session_event_log.open("a", encoding="utf-8") as handle:
+        with _long_session_log_lock:
+            _prune_long_session_logs()
+            with log_path.open("a", encoding="utf-8") as handle:
                 handle.write(line + "\n")
                 handle.flush()
     except Exception as exc:
@@ -209,102 +203,11 @@ def _long_session_status(conversation_url: str | None) -> dict[str, Any]:
     }
 
 
-def _list_long_sessions_snapshot() -> dict[str, Any]:
-    """Return a read-only snapshot of all currently active long-session lifecycles."""
-    now_monotonic = time.monotonic()
-    now_epoch = time.time()
-    with _long_session_lock:
-        started = dict(_long_session_started)
-        wakeup_urls = set(_long_session_wakeups)
-        wakeup_results = {
-            url: dict(result) for url, result in _long_session_wakeup_results.items()
-        }
-
-    active_urls = sorted(set(started) | wakeup_urls)
-    sessions: list[dict[str, Any]] = []
-    active_timer_count = 0
-    pending_wakeup_count = 0
-
-    for conversation_url in active_urls:
-        timer_started = started.get(conversation_url)
-        wakeup_pending = conversation_url in wakeup_urls
-        wakeup_result = wakeup_results.get(conversation_url)
-
-        timer: dict[str, Any] = {"active": timer_started is not None}
-        if timer_started is not None:
-            active_timer_count += 1
-            elapsed = max(0.0, now_monotonic - timer_started)
-            remaining = max(0.0, CONFIG.long_session_yield_after_seconds - elapsed)
-            timer.update(
-                {
-                    "elapsed_seconds": round(elapsed, 3),
-                    "remaining_seconds": round(remaining, 3),
-                    "yield_after_seconds": CONFIG.long_session_yield_after_seconds,
-                    "timed_out": remaining <= 0,
-                }
-            )
-
-        wakeup: dict[str, Any] = {"pending": wakeup_pending}
-        if wakeup_pending:
-            pending_wakeup_count += 1
-            if wakeup_result is not None:
-                wakeup.update(wakeup_result)
-                scheduled_at = wakeup_result.get("scheduled_at_epoch_seconds")
-                delay_seconds = wakeup_result.get("delay_seconds")
-                if isinstance(scheduled_at, (int, float)) and isinstance(
-                    delay_seconds, (int, float)
-                ):
-                    due_at = scheduled_at + delay_seconds
-                    wakeup["due_at_epoch_seconds"] = due_at
-                    wakeup["remaining_seconds"] = round(
-                        max(0.0, due_at - now_epoch), 3
-                    )
-
-        if timer_started is not None and wakeup_pending:
-            if (
-                timer.get("timed_out")
-                and wakeup_result is not None
-                and wakeup_result.get("kind") == "timeout_fallback"
-            ):
-                phase = "timed_out_fallback_scheduled"
-            else:
-                phase = "invalid_timer_and_wakeup"
-        elif timer_started is not None:
-            phase = "timer_active"
-        else:
-            wakeup_status = (
-                wakeup_result.get("status") if wakeup_result is not None else None
-            )
-            phase = (
-                f"wakeup_{wakeup_status}"
-                if isinstance(wakeup_status, str) and wakeup_status
-                else "wakeup_pending"
-            )
-
-        sessions.append(
-            {
-                "conversation_url": conversation_url,
-                "phase": phase,
-                "timer": timer,
-                "wakeup": wakeup,
-            }
-        )
-
-    return {
-        "status": "ok",
-        "count": len(sessions),
-        "active_timer_count": active_timer_count,
-        "pending_wakeup_count": pending_wakeup_count,
-        "event_log_path": str(CONFIG.long_session_event_log),
-        "sessions": sessions,
-    }
-
-
 class LongSessionFastMCP(FastMCP):
     async def list_tools(self):
         tools = await super().list_tools()
         for tool in tools:
-            if tool.name in {"start_timer", "end_timer", "register_wakeup", "list_long_sessions"}:
+            if tool.name in {"start_timer", "end_timer", "register_wakeup"}:
                 continue
             properties = tool.inputSchema.setdefault("properties", {})
             properties.setdefault(
@@ -322,7 +225,7 @@ class LongSessionFastMCP(FastMCP):
 
     async def call_tool(self, name: str, arguments: dict[str, Any]):
         forwarded = dict(arguments)
-        control_tools = {"start_timer", "end_timer", "register_wakeup", "list_long_sessions"}
+        control_tools = {"start_timer", "end_timer", "register_wakeup"}
         if name in control_tools:
             conversation_url = forwarded.get("conversation_url")
             if conversation_url is not None:
@@ -348,7 +251,6 @@ class LongSessionFastMCP(FastMCP):
                         _append_long_session_event(
                             "start_timer_blocked_timeout",
                             conversation_url,
-                            elapsed_seconds=current.get("elapsed_seconds"),
                             fallback_scheduled_now=fallback_wakeup.get(
                                 "scheduled_now", False
                             ),
@@ -381,7 +283,6 @@ class LongSessionFastMCP(FastMCP):
                 "tool_call_requested",
                 conversation_url,
                 tool_name=name,
-                elapsed_seconds=before.get("elapsed_seconds"),
                 remaining_seconds=before.get("remaining_seconds"),
                 timed_out=before.get("timed_out", False),
             )
@@ -391,7 +292,6 @@ class LongSessionFastMCP(FastMCP):
                 "tool_call_blocked_timeout",
                 conversation_url,
                 tool_name=name,
-                elapsed_seconds=before.get("elapsed_seconds"),
                 remaining_seconds=before.get("remaining_seconds"),
                 fallback_scheduled_now=fallback_wakeup.get("scheduled_now", False),
                 fallback_delay_seconds=fallback_wakeup.get("delay_seconds"),
@@ -413,7 +313,6 @@ class LongSessionFastMCP(FastMCP):
                 "tool_call_started",
                 conversation_url,
                 tool_name=name,
-                elapsed_seconds=before.get("elapsed_seconds"),
                 remaining_seconds=before.get("remaining_seconds"),
             )
 
@@ -436,7 +335,6 @@ class LongSessionFastMCP(FastMCP):
                 "tool_call_completed",
                 conversation_url,
                 tool_name=name,
-                elapsed_seconds=after.get("elapsed_seconds"),
                 remaining_seconds=after.get("remaining_seconds"),
                 timed_out=after.get("timed_out", False),
             )
@@ -499,8 +397,6 @@ mcp = LongSessionFastMCP(
         "logs. Call get_workspace_task with its defaults: it waits server-side for up to 30 "
         "seconds, returning sooner when the task finishes. If a task fails or times out, read "
         "its returned stderr_path with the workspace file tools for diagnostics. "
-        "Use list_long_sessions for a read-only debug snapshot of every conversation with an "
-        "active timer or pending wake-up; it requires no conversation URL. "
         "Model execution time is bounded. If you know the URL of your current ChatGPT "
         "conversation and expect to do substantial multi-step work, call start_timer with that "
         "URL before beginning. Delegated temporary-chat sub-agents created by "
@@ -513,8 +409,8 @@ mcp = LongSessionFastMCP(
         f"automatically ensures a safety-net wake-up exists for {CONFIG.long_session_timeout_fallback_delay_seconds} "
         "seconds later. A tool that started before the limit may finish atomically, but if it "
         "crosses the limit its result includes the same stop directive and the fallback is ensured "
-        "before returning. Only register_wakeup, end_timer, and list_long_sessions remain available "
-        "for long-session control/debug after timeout. The agent should still call register_wakeup "
+        "before returning. Only register_wakeup and end_timer remain available for long-session "
+        "control after timeout. The agent should still call register_wakeup "
         "when continuation is needed: it clears the expired timer, cancels/replaces the slower "
         f"fallback, and schedules the normal continuation after {CONFIG.long_session_wakeup_delay_seconds} "
         "seconds. When work finishes normally, "
@@ -538,6 +434,7 @@ _TIMEOUT_FALLBACK_WAKEUP_PROMPT = (
     "task completed; if it did not, continue from the latest safe checkpoint. If it did complete, "
     "report completion and stop."
 )
+_WAKEUP_LONG_RETRY_DELAYS_SECONDS = (5 * 60, 10 * 60, 20 * 60, 30 * 60, 60 * 60)
 
 
 def _schedule_long_session_wakeup(
@@ -625,7 +522,68 @@ def _ensure_timeout_fallback_wakeup(conversation_url: str) -> dict[str, Any]:
     )
 
 
-def _send_registered_wakeup(conversation_url: str, prompt: str) -> None:
+def _schedule_wakeup_send_retry(
+    conversation_url: str,
+    prompt: str,
+    *,
+    wakeup_kind: str,
+    retry_number: int,
+    error: BaseException,
+) -> bool:
+    """Schedule the next safe pre-send retry without resurrecting a superseded wake-up."""
+    if not 1 <= retry_number <= len(_WAKEUP_LONG_RETRY_DELAYS_SECONDS):
+        return False
+
+    delay_seconds = _WAKEUP_LONG_RETRY_DELAYS_SECONDS[retry_number - 1]
+    scheduled_at = time.time()
+    retry_timer = threading.Timer(
+        delay_seconds,
+        _send_registered_wakeup,
+        args=(conversation_url, prompt, retry_number),
+    )
+    retry_timer.daemon = True
+
+    with _long_session_lock:
+        owner = threading.current_thread()
+        current = _long_session_wakeups.get(conversation_url)
+        if isinstance(owner, threading.Timer):
+            # A newer register_wakeup/end_timer may have replaced or removed this
+            # callback while browser automation was running. Never resurrect it.
+            if current is not owner:
+                return False
+        elif current is not None:
+            # Direct/internal callers must not overwrite an independently scheduled wake-up.
+            return False
+
+        _long_session_wakeups[conversation_url] = retry_timer
+        _long_session_wakeup_results[conversation_url] = {
+            "status": "retry_scheduled",
+            "kind": wakeup_kind,
+            "scheduled_at_epoch_seconds": scheduled_at,
+            "delay_seconds": delay_seconds,
+            "retry_number": retry_number,
+            "error_type": type(error).__name__,
+            "error": str(error),
+        }
+        retry_timer.start()
+
+    _append_long_session_event(
+        "wakeup_long_retry_scheduled",
+        conversation_url,
+        wakeup_kind=wakeup_kind,
+        retry_number=retry_number,
+        delay_seconds=delay_seconds,
+        error_type=type(error).__name__,
+        error=str(error)[:1000],
+    )
+    return True
+
+
+def _send_registered_wakeup(
+    conversation_url: str,
+    prompt: str,
+    long_retry_number: int = 0,
+) -> None:
     rendered_prompt = (
         f"Conversation URL: {conversation_url}\n"
         f"The attached MCP app is {CONFIG.chatgpt_mcp_app_name}. Before doing any other "
@@ -642,14 +600,25 @@ def _send_registered_wakeup(conversation_url: str, prompt: str) -> None:
             "status": "sending",
             "kind": wakeup_kind,
             "started_at_epoch_seconds": time.time(),
+            "retry_number": long_retry_number,
         }
+
+    if long_retry_number:
+        _append_long_session_event(
+            "wakeup_long_retry_started",
+            conversation_url,
+            wakeup_kind=wakeup_kind,
+            retry_number=long_retry_number,
+        )
     _append_long_session_event(
         "wakeup_sending",
         conversation_url,
         wakeup_kind=wakeup_kind,
+        retry_number=long_retry_number,
     )
+
     try:
-        from chatgpt_playwright import send_prompt
+        from chatgpt_playwright import ChatGPTPreSendError, send_prompt
 
         result = send_prompt(
             rendered_prompt,
@@ -662,12 +631,31 @@ def _send_registered_wakeup(conversation_url: str, prompt: str) -> None:
             require_temporary_chat=False,
             mcp_app_name=CONFIG.chatgpt_mcp_app_name,
         )
-    except Exception as exc:
+    except ChatGPTPreSendError as exc:
+        _append_long_session_event(
+            "wakeup_short_retries_exhausted",
+            conversation_url,
+            wakeup_kind=wakeup_kind,
+            retry_number=long_retry_number,
+            error_type=type(exc).__name__,
+            error=str(exc)[:1000],
+        )
+        next_retry = long_retry_number + 1
+        if _schedule_wakeup_send_retry(
+            conversation_url,
+            prompt,
+            wakeup_kind=wakeup_kind,
+            retry_number=next_retry,
+            error=exc,
+        ):
+            return
+
         with _long_session_lock:
             _long_session_wakeup_results[conversation_url] = {
                 "status": "failed",
                 "kind": wakeup_kind,
                 "finished_at_epoch_seconds": time.time(),
+                "retry_number": long_retry_number,
                 "error_type": type(exc).__name__,
                 "error": str(exc),
             }
@@ -675,6 +663,30 @@ def _send_registered_wakeup(conversation_url: str, prompt: str) -> None:
             "wakeup_failed",
             conversation_url,
             wakeup_kind=wakeup_kind,
+            retry_number=long_retry_number,
+            long_retries_exhausted=(
+                long_retry_number >= len(_WAKEUP_LONG_RETRY_DELAYS_SECONDS)
+            ),
+            error_type=type(exc).__name__,
+            error=str(exc)[:1000],
+        )
+    except Exception as exc:
+        # Rate-limit and any post-Send/ambiguous failures retain their existing
+        # semantics: they are not safe members of the automatic resend chain.
+        with _long_session_lock:
+            _long_session_wakeup_results[conversation_url] = {
+                "status": "failed",
+                "kind": wakeup_kind,
+                "finished_at_epoch_seconds": time.time(),
+                "retry_number": long_retry_number,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+        _append_long_session_event(
+            "wakeup_failed",
+            conversation_url,
+            wakeup_kind=wakeup_kind,
+            retry_number=long_retry_number,
             error_type=type(exc).__name__,
             error=str(exc)[:1000],
         )
@@ -684,24 +696,20 @@ def _send_registered_wakeup(conversation_url: str, prompt: str) -> None:
                 "status": "sent",
                 "kind": wakeup_kind,
                 "finished_at_epoch_seconds": time.time(),
+                "retry_number": long_retry_number,
                 "browser_result": result,
             }
         _append_long_session_event(
             "wakeup_sent",
             conversation_url,
             wakeup_kind=wakeup_kind,
+            retry_number=long_retry_number,
         )
     finally:
         with _long_session_lock:
             current = _long_session_wakeups.get(conversation_url)
             if current is threading.current_thread():
                 _long_session_wakeups.pop(conversation_url, None)
-
-
-@mcp.tool()
-def list_long_sessions() -> dict[str, Any]:
-    """List all conversations with an active timer or pending wake-up."""
-    return _list_long_sessions_snapshot()
 
 
 @mcp.tool()
@@ -2576,8 +2584,8 @@ if __name__ == "__main__":
     CONFIG.tasks_root.mkdir(parents=True, exist_ok=True)
     CONFIG.logs_root.mkdir(parents=True, exist_ok=True)
     _prune_old_workspace_tasks()
-    with _long_session_event_log_lock:
-        _prune_long_session_event_log(force=True)
+    with _long_session_log_lock:
+        _prune_long_session_logs(force=True)
     if CONFIG.execution_home:
         Path(CONFIG.execution_home).mkdir(parents=True, exist_ok=True)
     mcp.run(transport="streamable-http")

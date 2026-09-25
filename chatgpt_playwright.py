@@ -850,7 +850,7 @@ def send_prompt(
 
     if reservation_task_id is not None and reservation_slot is not None:
         release_browser_slot(reservation_task_id, reservation_slot)
-    raise RuntimeError(
+    raise ChatGPTPreSendError(
         f"ChatGPT pre-send automation failed after {attempts} attempts: {last_error}"
     ) from last_error
 
