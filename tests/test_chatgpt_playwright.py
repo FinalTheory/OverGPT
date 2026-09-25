@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 import os
 import sys
 import tempfile
@@ -298,11 +299,19 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="mymcp-workspace-") as workspace:
         os.environ["MCP_WORKSPACE_ROOT"] = workspace
         os.environ["MCP_CHATGPT_AUTOMATION_ENABLED"] = "true"
+        import config
         import server
 
+        test_config = replace(
+            server.CONFIG,
+            runtime_root=Path(workspace, "mymcp"),
+        )
+        server.CONFIG = test_config
+        config.CONFIG = test_config
+
         rendered_subagent_prompt = server._render_chatgpt_subagent_prompt(
-            ".mcp-tasks/task_00000000000000000000000000000000/input.md",
-            ".mcp-tasks/task_00000000000000000000000000000000/output.md",
+            "mymcp/task_state/00000000000000000000000000000000/input.md",
+            "mymcp/task_state/00000000000000000000000000000000/output.md",
         )
         if server.CONFIG.chatgpt_mcp_app_name not in rendered_subagent_prompt:
             raise RuntimeError("configured MCP app name was not rendered into sub-agent prompt")
@@ -475,7 +484,9 @@ def main() -> None:
             "task_00000000000000000000000000000003": ("running", old_finished),
         }
         for task_id, (status, finished_at) in task_fixtures.items():
-            task_dir = Path(workspace, ".mcp-tasks", task_id)
+            task_dir = Path(
+                workspace, "mymcp", "task_state", task_id.removeprefix("task_")
+            )
             task_dir.mkdir(parents=True)
             task_dir.joinpath("status.json").write_text(
                 json.dumps({"status": status, "finished_at": finished_at}),
@@ -484,10 +495,17 @@ def main() -> None:
         removed = server._prune_old_workspace_tasks()
         if removed != 1:
             raise RuntimeError(f"expected one expired task removal, got {removed}")
-        if Path(workspace, ".mcp-tasks", next(iter(task_fixtures))).exists():
+        if Path(
+            workspace,
+            "mymcp",
+            "task_state",
+            next(iter(task_fixtures)).removeprefix("task_"),
+        ).exists():
             raise RuntimeError("expired completed task was not removed")
         for task_id in list(task_fixtures)[1:]:
-            if not Path(workspace, ".mcp-tasks", task_id).is_dir():
+            if not Path(
+                workspace, "mymcp", "task_state", task_id.removeprefix("task_")
+            ).is_dir():
                 raise RuntimeError(f"active or recent task was removed: {task_id}")
 
         async def verify_nonblocking_task_wait() -> None:
@@ -583,7 +601,9 @@ def main() -> None:
 
         delegated_task = "THIS_CONTENT_MUST_NOT_BE_IN_THE_BROWSER_PROMPT"
         demo_task_id = "task_" + "d" * 32
-        demo_task_dir = Path(workspace, ".mcp-tasks", demo_task_id).resolve()
+        demo_task_dir = Path(
+            workspace, "mymcp", "task_state", demo_task_id.removeprefix("task_")
+        ).resolve()
         demo_task_dir.mkdir()
         with (
             patch.object(
@@ -595,9 +615,9 @@ def main() -> None:
                 return_value={
                     "task_id": demo_task_id,
                     "status": "queued",
-                    "task_dir": f".mcp-tasks/{demo_task_id}",
-                    "stdout_path": f".mcp-tasks/{demo_task_id}/stdout.log",
-                    "stderr_path": f".mcp-tasks/{demo_task_id}/stderr.log",
+                    "task_dir": f"mymcp/task_state/{demo_task_id.removeprefix('task_')}",
+                    "stdout_path": f"mymcp/task_state/{demo_task_id.removeprefix('task_')}/stdout.log",
+                    "stderr_path": f"mymcp/task_state/{demo_task_id.removeprefix('task_')}/stderr.log",
                 },
             ) as mocked_start,
             patch.object(
@@ -632,7 +652,9 @@ def main() -> None:
             raise RuntimeError(f"allocated paths do not share one directory: {delegated}")
         if Path(workspace, delegated["output_path"]).exists():
             raise RuntimeError("sub-agent output was pre-created instead of child-created")
-        if not delegated["input_path"].startswith(f".mcp-tasks/{demo_task_id}/"):
+        if not delegated["input_path"].startswith(
+            f"mymcp/task_state/{demo_task_id.removeprefix('task_')}/"
+        ):
             raise RuntimeError(f"sub-agent artifacts are not task-owned: {delegated}")
         if (
             delegated["status"] != "started"
@@ -650,7 +672,9 @@ def main() -> None:
             raise RuntimeError("empty delegated task was accepted")
 
         full_task_id = "task_" + "e" * 32
-        full_task_dir = Path(workspace, ".mcp-tasks", full_task_id).resolve()
+        full_task_dir = Path(
+            workspace, "mymcp", "task_state", full_task_id.removeprefix("task_")
+        ).resolve()
         full_task_dir.mkdir()
         with (
             patch.object(
@@ -676,7 +700,10 @@ def main() -> None:
 
         failed_start_task_id = "task_" + "f" * 32
         failed_start_task_dir = Path(
-            workspace, ".mcp-tasks", failed_start_task_id
+            workspace,
+            "mymcp",
+            "task_state",
+            failed_start_task_id.removeprefix("task_"),
         ).resolve()
         failed_start_task_dir.mkdir()
         with (
@@ -713,12 +740,12 @@ def main() -> None:
         started_a = {
             "task_id": "task_" + "a" * 32,
             "status": "queued",
-            "output_path": ".mcp-tasks/task_a/output.md",
+            "output_path": f"mymcp/task_state/{'a' * 32}/output.md",
         }
         started_b = {
             "task_id": "task_" + "b" * 32,
             "status": "queued",
-            "output_path": ".mcp-tasks/task_b/output.md",
+            "output_path": f"mymcp/task_state/{'b' * 32}/output.md",
         }
         with patch.object(
             server,

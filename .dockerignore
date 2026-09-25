@@ -1,8 +1,8 @@
 __pycache__/
 *.py[cod]
 .ruff_cache/
-.mcp-tasks/
-.mcp-state/
+task_state/
+logs/
 temp/
 *.sync-conflict-*
 .git/

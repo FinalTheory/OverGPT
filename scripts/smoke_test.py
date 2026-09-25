@@ -496,10 +496,10 @@ async def main(url: str) -> None:
                         "rm -f -- "
                         f"{shlex.quote(SMOKE_FILE)} {shlex.quote(GUARD_FILE)} "
                         "draft/.mcp-revert-smoke-test.md; "
-                        f"rm -rf -- .mcp-tasks/{background_task_id} "
-                        f".mcp-tasks/{timeout_task_id} "
-                        f".mcp-tasks/{cancellable_task_id} "
-                        f".mcp-tasks/{responsiveness_id}"
+                        f"rm -rf -- mymcp/task_state/{background_task_id.removeprefix('task_')} "
+                        f"mymcp/task_state/{timeout_task_id.removeprefix('task_')} "
+                        f"mymcp/task_state/{cancellable_task_id.removeprefix('task_')} "
+                        f"mymcp/task_state/{responsiveness_id.removeprefix('task_')}"
                     ),
                     "cwd": ".",
                 },

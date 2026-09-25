@@ -39,6 +39,53 @@ _long_session_started: dict[str, float] = {}
 _long_session_wakeups: dict[str, threading.Timer] = {}
 _long_session_wakeup_results: dict[str, dict[str, Any]] = {}
 _long_session_event_log_lock = threading.RLock()
+_long_session_event_log_last_pruned_monotonic = 0.0
+
+
+def _prune_long_session_event_log(*, force: bool = False) -> int:
+    """Drop lifecycle events older than the configured retention window in place."""
+    global _long_session_event_log_last_pruned_monotonic
+
+    now_monotonic = time.monotonic()
+    if (
+        not force
+        and now_monotonic - _long_session_event_log_last_pruned_monotonic
+        < CONFIG.long_session_log_prune_interval_seconds
+    ):
+        return 0
+    _long_session_event_log_last_pruned_monotonic = now_monotonic
+
+    path = CONFIG.long_session_event_log
+    if not path.is_file():
+        return 0
+    cutoff = datetime.now(UTC) - timedelta(days=CONFIG.long_session_log_retention_days)
+    kept: list[str] = []
+    removed = 0
+    with path.open("r+", encoding="utf-8") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped:
+                kept.append(line)
+                continue
+            try:
+                record = json.loads(stripped)
+                timestamp = datetime.fromisoformat(str(record["timestamp"]))
+                if timestamp.tzinfo is None:
+                    timestamp = timestamp.replace(tzinfo=UTC)
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                # Preserve malformed/legacy lines rather than deleting forensic data.
+                kept.append(line)
+                continue
+            if timestamp.astimezone(UTC) < cutoff:
+                removed += 1
+            else:
+                kept.append(line)
+        if removed:
+            handle.seek(0)
+            handle.writelines(kept)
+            handle.truncate()
+            handle.flush()
+    return removed
 
 
 def _append_long_session_event(
@@ -49,7 +96,6 @@ def _append_long_session_event(
     """Append one bounded lifecycle event without making logging a correctness dependency."""
     record = {
         "timestamp": datetime.now(UTC).isoformat(),
-        "epoch_seconds": time.time(),
         "event": event,
         "conversation_url": conversation_url,
         **fields,
@@ -58,8 +104,10 @@ def _append_long_session_event(
         CONFIG.long_session_event_log.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(record, ensure_ascii=False, sort_keys=True)
         with _long_session_event_log_lock:
+            _prune_long_session_event_log()
             with CONFIG.long_session_event_log.open("a", encoding="utf-8") as handle:
                 handle.write(line + "\n")
+                handle.flush()
     except Exception as exc:
         print(
             f"long-session event logging failed: {type(exc).__name__}: {exc}",
@@ -1075,9 +1123,10 @@ def _utc_now() -> str:
 
 
 def _task_dir(task_id: str) -> Path:
-    if not re.fullmatch(r"task_[0-9a-f]{32}", task_id):
+    match = re.fullmatch(r"task_([0-9a-f]{32})", task_id)
+    if match is None:
         raise ValueError("invalid task_id")
-    resolved = (CONFIG.tasks_root / task_id).resolve()
+    resolved = (CONFIG.tasks_root / match.group(1)).resolve()
     if CONFIG.tasks_root not in resolved.parents:
         raise ValueError("task path escapes the task directory")
     return resolved
@@ -1117,7 +1166,7 @@ def _worker_is_alive(pid: Any, start_time: Any, task_id: str) -> bool:
         snapshot
         and snapshot["start_time"] == start_time
         and "workspace_task_runner.py" in snapshot["cmdline"]
-        and task_id in snapshot["cmdline"]
+        and task_id.removeprefix("task_") in snapshot["cmdline"]
     )
 
 
@@ -1181,7 +1230,7 @@ def _prune_old_workspace_tasks() -> int:
     removed = 0
     for task_dir in list(CONFIG.tasks_root.iterdir()):
         if (
-            not re.fullmatch(r"task_[0-9a-f]{32}", task_dir.name)
+            not re.fullmatch(r"[0-9a-f]{32}", task_dir.name)
             or task_dir.is_symlink()
             or not task_dir.is_dir()
         ):
@@ -1192,7 +1241,7 @@ def _prune_old_workspace_tasks() -> int:
         try:
             status = _read_task_json(status_path)
             if status.get("status") in {"queued", "running"}:
-                status = _recover_workspace_task(task_dir, task_dir.name)
+                status = _recover_workspace_task(task_dir, f"task_{task_dir.name}")
             if status.get("status") not in _TERMINAL_TASK_STATES:
                 continue
             timestamp = status.get("finished_at") or status.get("created_at")
@@ -1702,7 +1751,8 @@ def search_workspace_text(
     root = _workspace_path(path, must_exist=True)
     skipped_dirnames = {
         ".git",
-        ".mcp-tasks",
+        "task_state",
+        "logs",
         "chatgpt-profile",
         "node_modules",
         "__pycache__",
@@ -2524,7 +2574,10 @@ def skill_resource(name: str) -> str:
 if __name__ == "__main__":
     CONFIG.workspace_root.mkdir(parents=True, exist_ok=True)
     CONFIG.tasks_root.mkdir(parents=True, exist_ok=True)
+    CONFIG.logs_root.mkdir(parents=True, exist_ok=True)
     _prune_old_workspace_tasks()
+    with _long_session_event_log_lock:
+        _prune_long_session_event_log(force=True)
     if CONFIG.execution_home:
         Path(CONFIG.execution_home).mkdir(parents=True, exist_ok=True)
     mcp.run(transport="streamable-http")

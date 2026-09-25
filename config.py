@@ -36,14 +36,15 @@ def _env_bool(name: str, default: bool) -> bool:
 @dataclass(frozen=True)
 class Config:
     project_root: Path = SOURCE_ROOT
+    runtime_root: Path = SOURCE_ROOT
     workspace_root: Path = Path(
         os.getenv("MCP_WORKSPACE_ROOT", "/opt/workspace")
     ).resolve()
     additional_root: Path | None = _env_optional_path("MCP_ADDITIONAL_ROOT")
     skills_dirname: str = "skills"
     draft_dirname: str = "draft"
-    tasks_dirname: str = ".mcp-tasks"
-    state_dirname: str = ".mcp-state"
+    tasks_dirname: str = "task_state"
+    logs_dirname: str = "logs"
     draft_diff_page: Path = SOURCE_ROOT / "web" / "draft_diff.html"
     draft_commit_password: str = os.getenv(
         "MCP_DRAFT_COMMIT_PASSWORD", "change-this-password"
@@ -73,6 +74,8 @@ class Config:
     task_default_wait_seconds: int = 30
     task_max_wait_seconds: int = 60
     task_retention_days: int = 30
+    long_session_log_retention_days: int = 3
+    long_session_log_prune_interval_seconds: int = 60 * 60
     execution_home: str = os.getenv("MCP_EXECUTION_HOME", "")
     restart_delay_seconds: float = 2.0
     long_session_yield_after_seconds: int = 20 * 60
@@ -105,16 +108,22 @@ class Config:
 
     @property
     def tasks_root(self) -> Path:
-        return (self.workspace_root / self.tasks_dirname).resolve()
-
+        return (self.runtime_root / self.tasks_dirname).resolve()
 
     @property
-    def state_root(self) -> Path:
-        return (self.project_root / self.state_dirname).resolve()
+    def logs_root(self) -> Path:
+        return (self.runtime_root / self.logs_dirname).resolve()
+
+    @property
+    def tasks_workspace_path(self) -> str:
+        try:
+            return self.tasks_root.relative_to(self.workspace_root).as_posix()
+        except ValueError as error:
+            raise RuntimeError("runtime task_state directory must stay inside workspace_root") from error
 
     @property
     def long_session_event_log(self) -> Path:
-        return self.state_root / "long-session-events.jsonl"
+        return self.logs_root / "long-session-events.jsonl"
 
 
 CONFIG = Config()

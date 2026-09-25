@@ -305,10 +305,10 @@ def normalize_workspace_relative_path(relative_path: str) -> str:
 
 
 def validate_subagent_path_pair(
-    input_path: str, output_path: str, tasks_dirname: str
+    input_path: str, output_path: str, tasks_root: str
 ) -> str:
-    """Validate one task-owned .mcp-tasks/task_<uid>/input-output pair."""
-    task_parts = PurePosixPath(tasks_dirname).parts
+    """Validate one task-owned task_state/<uid>/input-output pair."""
+    task_parts = PurePosixPath(tasks_root).parts
     input_parts = PurePosixPath(input_path).parts
     output_parts = PurePosixPath(output_path).parts
     prefix_length = len(task_parts)
@@ -321,13 +321,13 @@ def validate_subagent_path_pair(
         or input_parts[-1] != "input.md"
         or output_parts[-1] != "output.md"
         or input_parts[-2] != output_parts[-2]
-        or not re.fullmatch(r"task_[0-9a-f]{32}", input_parts[-2])
+        or not re.fullmatch(r"[0-9a-f]{32}", input_parts[-2])
     ):
         raise ValueError(
-            "paths must be one internally allocated .mcp-tasks/task_<uid>/"
+            "paths must be one internally allocated task_state/<uid>/"
             "input.md and output.md pair"
         )
-    return input_parts[-2]
+    return f"task_{input_parts[-2]}"
 
 
 def normalize_workspace_file(
@@ -940,7 +940,7 @@ def send_subagent_task(
     if normalized_input == normalized_output:
         raise ValueError("input_path and output_path must be different files")
     task_id = validate_subagent_path_pair(
-        normalized_input, normalized_output, CONFIG.tasks_dirname
+        normalized_input, normalized_output, CONFIG.tasks_workspace_path
     )
     prompt = render_subagent_prompt(
         CONFIG.chatgpt_prompt_file,

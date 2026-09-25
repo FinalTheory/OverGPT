@@ -9,6 +9,7 @@ import tempfile
 import time
 import unittest
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -379,7 +380,7 @@ class LongSessionTests(unittest.TestCase):
     def test_long_session_event_log_persists_lifecycle_trace(self) -> None:
         url = "https://chatgpt.com/c/persistent-trace"
         with tempfile.TemporaryDirectory() as temp_dir:
-            test_config = replace(server.CONFIG, project_root=Path(temp_dir))
+            test_config = replace(server.CONFIG, runtime_root=Path(temp_dir))
             with (
                 patch.object(server, "CONFIG", test_config),
                 patch.object(server.threading, "Timer", FakeTimer),
@@ -413,6 +414,34 @@ class LongSessionTests(unittest.TestCase):
             ],
         )
         self.assertTrue(all(event["conversation_url"] == url for event in events))
+        self.assertTrue(all("epoch_seconds" not in event for event in events))
+
+    def test_long_session_event_log_retains_only_recent_three_days(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            test_config = replace(server.CONFIG, runtime_root=Path(temp_dir))
+            log_path = test_config.long_session_event_log
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            old_timestamp = (datetime.now(UTC) - timedelta(days=4)).isoformat()
+            recent_timestamp = (datetime.now(UTC) - timedelta(days=1)).isoformat()
+            log_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"timestamp": old_timestamp, "event": "old"}),
+                        json.dumps({"timestamp": recent_timestamp, "event": "recent"}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with patch.object(server, "CONFIG", test_config):
+                removed = server._prune_long_session_event_log(force=True)
+            self.assertEqual(removed, 1)
+            events = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual([event["event"] for event in events], ["recent"])
 
     def test_ordinary_tool_without_url_is_unmodified_for_clean_subagents(self) -> None:
         result = asyncio.run(

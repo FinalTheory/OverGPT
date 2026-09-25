@@ -4,7 +4,7 @@
 
 <h1 align="center">OverGPT</h1>
 
-<p align="center"><strong>通过 MCP 为 ChatGPT 提供持久执行与递归 sub-agent 能力。</strong></p>
+<p align="center"><strong>通过 MCP 为 ChatGPT 提供持久执行长任务以及孵化干净上下文 sub-agent 的能力。</strong></p>
 
 <p align="center">
   <a href="README.md">English</a> · <a href="README.zh-CN.md">中文</a>
