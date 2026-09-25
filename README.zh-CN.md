@@ -1,10 +1,10 @@
-# GPTOvertime
+# OverGPT
 
 **通过 MCP 为 ChatGPT 提供持久执行与递归 sub-agent 能力。**
 
 [English](README.md) · [中文](README.zh-CN.md)
 
-GPTOvertime 是 [WebCodex](https://github.com/yyjeqhc/webcodex) 的配套增强。WebCodex 让 ChatGPT 拥有真实的开发环境；GPTOvertime 则让 ChatGPT 自己能够跨越单次模型执行周期继续工作，并把独立任务委派给新的 ChatGPT sub-agent。
+OverGPT 是 [WebCodex](https://github.com/yyjeqhc/webcodex) 的配套增强。WebCodex 让 ChatGPT 拥有真实的开发环境；OverGPT 则让 ChatGPT 自己能够跨越单次模型执行周期继续工作，并把独立任务委派给新的 ChatGPT sub-agent。
 
 ## 为什么会有这个项目
 
@@ -29,11 +29,11 @@ WebCodex 已经很好地解决了开发环境这一侧的问题：
 
 第二，一个对话的上下文不一定适合复杂任务中的所有分支。独立 review、验证、研究或者不同实现方案，很多时候放进新的 sub-agent 干净上下文里效果更好。
 
-GPTOvertime 主要补上这两个能力。
+OverGPT 主要补上这两个能力。
 
-## GPTOvertime 和 WebCodex 怎么配合
+## OverGPT 和 WebCodex 怎么配合
 
-从概念上看，WebCodex 是 **开发环境**，GPTOvertime 是 ChatGPT 一侧的 **执行控制层**。
+从概念上看，WebCodex 是 **开发环境**，OverGPT 是 ChatGPT 一侧的 **执行控制层**。
 
 ```text
                          ChatGPT
@@ -41,7 +41,7 @@ GPTOvertime 主要补上这两个能力。
               ┌─────────────┴─────────────┐
               │                           │
               ▼                           ▼
-         GPTOvertime                  WebCodex
+         OverGPT                  WebCodex
            执行控制                    开发工具
               │                           │
       ┌───────┼────────┐                  ▼
@@ -57,17 +57,17 @@ GPTOvertime 主要补上这两个能力。
       └───────┴─── 使用同一套 MCP 环境
 ```
 
-所以 WebCodex 用户不需要改变现有代码库、Git checkout、测试或者本地工具链。GPTOvertime 直接在这套工作流上补充更长的 ChatGPT 执行生命周期和递归委派能力。
+所以 WebCodex 用户不需要改变现有代码库、Git checkout、测试或者本地工具链。OverGPT 直接在这套工作流上补充更长的 ChatGPT 执行生命周期和递归委派能力。
 
-GPTOvertime 不取代 WebCodex。两个项目解决的是同一个工作流里的不同层次。
+OverGPT 不取代 WebCodex。两个项目解决的是同一个工作流里的不同层次。
 
 ## 跨越单次 ChatGPT turn 继续执行
 
-GPTOvertime 会为一个 ChatGPT 对话维护由服务端决定的执行计时。
+OverGPT 会为一个 ChatGPT 对话维护由服务端决定的执行计时。
 
 长 session 启用以后，MCP 工具返回值会包含当前剩余执行预算。当这一轮接近执行边界时，ChatGPT 可以完成当前原子步骤，保存足够的恢复状态，然后注册下一次唤醒。
 
-GPTOvertime 随后会向同一个对话发送继续执行的消息。
+OverGPT 随后会向同一个对话发送继续执行的消息。
 
 ```text
 开始
@@ -93,7 +93,7 @@ GPTOvertime 随后会向同一个对话发送继续执行的消息。
 
 ## 孵化新的递归 sub-agent
 
-GPTOvertime 可以启动新的 ChatGPT 对话作为独立 worker。
+OverGPT 可以启动新的 ChatGPT 对话作为独立 worker。
 
 每个委派任务都有明确的输入、持久化输出、任务状态和独立浏览器执行槽。父代理会立即拿到 task ID，因此可以在子任务独立运行时继续自己的工作。
 
@@ -119,13 +119,13 @@ sub-agent 还可以继续使用同一套机制向下委派，因此整个过程�
 
 ## 持久化执行状态
 
-GPTOvertime 会把任务交接和完成状态保存在单次模型 turn 之外。
+OverGPT 会把任务交接和完成状态保存在单次模型 turn 之外。
 
 sub-agent 的输入和输出都会写入共享 workspace。后台任务拥有明确的状态，例如 `queued`、`running`、`succeeded`、`failed`、`timed_out` 和 `cancelled`。
 
 这样父对话可以通过真实状态监督被委派的工作，而不需要依赖隐藏在内存里的 agent orchestration。
 
-WebCodex 可以继续负责代码库执行和耗时较长的开发任务。GPTOvertime 的持久状态主要服务于模型侧生命周期：续接、委派、监督和结果回收。
+WebCodex 可以继续负责代码库执行和耗时较长的开发任务。OverGPT 的持久状态主要服务于模型侧生命周期：续接、委派、监督和结果回收。
 
 ## 当前实现
 
@@ -133,7 +133,7 @@ WebCodex 可以继续负责代码库执行和耗时较长的开发任务。GPTOv
 
 会话续接和 sub-agent 孵化通过 Playwright 驱动已经登录的 ChatGPT Web 会话完成。持久 workspace 文件负责任务交接和结果回收，MCP server 提供计时、任务监督以及继续执行和委派所需要的控制能力。
 
-GPTOvertime 自己也带有基础 workspace 工具，但它的目标是与 WebCodex 配合使用。对于软件工程场景，WebCodex 提供更完整的代码库和开发工具层，GPTOvertime 则负责让 ChatGPT 能够跨 turn 持续工作，并把独立任务拆到新的对话里执行。
+OverGPT 自己也带有基础 workspace 工具，但它的目标是与 WebCodex 配合使用。对于软件工程场景，WebCodex 提供更完整的代码库和开发工具层，OverGPT 则负责让 ChatGPT 能够跨 turn 持续工作，并把独立任务拆到新的对话里执行。
 
 ---
 

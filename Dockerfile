@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-# Keep the Writer image as the canonical AI/development workstation base.
+# Keep the OverGPT image as the canonical AI/development workstation base.
 # WebCodex and future tooling can inherit this image and only add their own binaries.
 FROM node:22-bookworm-slim AS node-runtime
 

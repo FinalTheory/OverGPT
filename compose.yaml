@@ -1,6 +1,6 @@
 services:
   mcp:
-    image: local/writer-base:latest
+    image: local/overgpt-base:latest
     build:
       context: .
       args:
@@ -15,10 +15,11 @@ services:
       MCP_WORKSPACE_ROOT: /opt/workspace
       MCP_PROJECT_RELATIVE_PATH: ${MCP_PROJECT_RELATIVE_PATH:-mymcp}
       MCP_DRAFT_COMMIT_PASSWORD: ${MCP_DRAFT_COMMIT_PASSWORD:-change-this-password}
-      MCP_SERVER_NAME: ${MCP_SERVER_NAME:-Writing Workspace MCP}
+      MCP_SERVER_NAME: ${MCP_SERVER_NAME:-OverGPT}
       MCP_PORT: ${MCP_PORT:-8765}
       MCP_EXECUTION_HOME: /tmp/mcp-home
       MCP_CHATGPT_AUTOMATION_ENABLED: ${MCP_CHATGPT_AUTOMATION_ENABLED:-false}
+      MCP_APP_NAME: ${MCP_APP_NAME:-OverGPT}
       MCP_CHATGPT_BROWSER_CHANNEL: ${MCP_CHATGPT_BROWSER_CHANNEL:-}
       MCP_CHATGPT_BROWSER_HEADLESS: ${MCP_CHATGPT_BROWSER_HEADLESS:-true}
     volumes:
@@ -39,7 +40,7 @@ services:
 
   browser-login:
     profiles: ["login"]
-    image: local/writer-base:latest
+    image: local/overgpt-base:latest
     build:
       context: .
       args:

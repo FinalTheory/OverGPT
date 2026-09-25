@@ -51,7 +51,7 @@ class Config:
     git_word_diff_regex: str = "[[:alnum:]_]+|[^[:space:]]"
     draft_history_limit: int = 20
 
-    server_name: str = os.getenv("MCP_SERVER_NAME", "Writing Workspace MCP")
+    server_name: str = os.getenv("MCP_SERVER_NAME", "OverGPT")
     host: str = "0.0.0.0"
     port: int = int(os.getenv("MCP_PORT", "8765"))
     mcp_path: str = "/mcp"
@@ -75,7 +75,7 @@ class Config:
     execution_home: str = os.getenv("MCP_EXECUTION_HOME", "")
     restart_delay_seconds: float = 2.0
     long_session_yield_after_seconds: int = 20 * 60
-    long_session_wakeup_delay_seconds: int = 2 * 60
+    long_session_wakeup_delay_seconds: int = 60
 
     chatgpt_automation_enabled: bool = _env_bool(
         "MCP_CHATGPT_AUTOMATION_ENABLED", False
@@ -87,6 +87,7 @@ class Config:
     chatgpt_browser_no_sandbox: bool = _env_bool(
         "MCP_CHATGPT_BROWSER_NO_SANDBOX", False
     )
+    chatgpt_mcp_app_name: str = os.getenv("MCP_APP_NAME", "OverGPT").strip()
     chatgpt_profile_dir: Path = SOURCE_ROOT / "chatgpt-profile"
     chatgpt_prompt_file: Path = SOURCE_ROOT / "prompts" / "chatgpt_subagent.md"
     chatgpt_browser_timeout_seconds: int = 30

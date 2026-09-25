@@ -62,7 +62,7 @@ class Handler(BaseHTTPRequestHandler):
                 f"test result\n{self.completion_sentinel}", encoding="utf-8"
             )
         body = (
-            b'<div data-message-author-role="user">browser smoke test</div>'
+            b'<div data-message-author-role="user">browser marker</div>'
             if "temporary-chat=true" in self.path and "sent=1" in self.path
             else HTML.encode()
         )
@@ -299,6 +299,15 @@ def main() -> None:
         os.environ["MCP_WORKSPACE_ROOT"] = workspace
         os.environ["MCP_CHATGPT_AUTOMATION_ENABLED"] = "true"
         import server
+
+        rendered_subagent_prompt = server._render_chatgpt_subagent_prompt(
+            ".mcp-tasks/task_00000000000000000000000000000000/input.md",
+            ".mcp-tasks/task_00000000000000000000000000000000/output.md",
+        )
+        if server.CONFIG.chatgpt_mcp_app_name not in rendered_subagent_prompt:
+            raise RuntimeError("configured MCP app name was not rendered into sub-agent prompt")
+        if "{{MCP_APP_NAME}}" in rendered_subagent_prompt:
+            raise RuntimeError("sub-agent prompt left MCP app placeholder unresolved")
 
         file_api_root = "file-api"
         created_file = server.write_workspace_file(
@@ -796,6 +805,8 @@ def main() -> None:
         ):
             chatgpt_playwright.main()
         markers = mocked_cli_send.call_args.kwargs["verification_markers"]
+        if mocked_cli_send.call_args.kwargs["mcp_app_name"] != server.CONFIG.chatgpt_mcp_app_name:
+            raise RuntimeError("sub-agent send did not attach the configured MCP app")
         if (
             delegated["input_path"] not in markers
             or delegated["output_path"] not in markers

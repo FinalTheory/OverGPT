@@ -1,12 +1,12 @@
-# GPTOvertime Agent Instructions
+# OverGPT Agent Instructions
 
-This file contains operational and repository-development instructions for agents working on GPTOvertime. The public README intentionally stays focused on the project model and user-facing concepts.
+This file contains operational and repository-development instructions for agents working on OverGPT. The public README intentionally stays focused on the project model and user-facing concepts.
 
 ## Determine how this repository is being accessed
 
-Before doing any repository work, first determine whether you are already operating on the canonical workspace through the GPTOvertime/Writer MCP tools.
+Before doing any repository work, first determine whether you are already operating on the canonical workspace through the OverGPT MCP app configured for this deployment.
 
-### When operating through MCP / Writer
+### When operating through the OverGPT MCP app
 
 If the repository is being read or modified through the connected MCP workspace, **do not run `make sync-down`**.
 
@@ -114,4 +114,4 @@ Keep secrets, `.env`, authenticated browser profiles, per-task browser profiles,
 
 Do not duplicate machine paths, SSH endpoints, ports, credentials, or deployment-specific values in source documentation. Put them in `.env`.
 
-The repository's public naming is **GPTOvertime**. Historical internal identifiers may remain temporarily where changing them would affect compatibility, but new documentation and user-facing names should use GPTOvertime.
+Use **OverGPT** consistently for project naming in source, documentation, images, and user-facing text. The deployment-specific ChatGPT MCP app display name must come from `MCP_APP_NAME`; do not hard-code an app name into prompts or browser automation.

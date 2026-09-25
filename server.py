@@ -197,7 +197,9 @@ _DEFAULT_WAKEUP_PROMPT = "Continue the previous task from where you stopped."
 def _send_registered_wakeup(conversation_url: str, prompt: str) -> None:
     rendered_prompt = (
         f"Conversation URL: {conversation_url}\n"
-        "Call start_timer with the conversation URL above before continuing MCP work.\n\n"
+        f"The attached MCP app is {CONFIG.chatgpt_mcp_app_name}. Before doing any other "
+        "MCP work, call its start_timer tool with the conversation URL above. Only after "
+        "that call succeeds, continue the previous task.\n\n"
         f"{prompt}"
     )
     with _long_session_lock:
@@ -217,6 +219,7 @@ def _send_registered_wakeup(conversation_url: str, prompt: str) -> None:
             timeout_seconds=CONFIG.chatgpt_browser_timeout_seconds,
             verification_markers=(conversation_url,),
             require_temporary_chat=False,
+            mcp_app_name=CONFIG.chatgpt_mcp_app_name,
         )
     except Exception as exc:
         with _long_session_lock:
@@ -475,6 +478,7 @@ def _render_chatgpt_subagent_prompt(input_path: str, output_path: str) -> str:
         CONFIG.chatgpt_prompt_file,
         input_path,
         output_path,
+        CONFIG.chatgpt_mcp_app_name,
     )
 
 
