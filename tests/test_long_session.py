@@ -178,11 +178,12 @@ class LongSessionTests(unittest.TestCase):
         self.assertEqual(server._long_session_wakeup_results[url]["status"], "sent")
         self.assertEqual(kwargs["url"], url)
         self.assertFalse(kwargs["require_temporary_chat"])
+        self.assertEqual(kwargs["verification_markers"], (url,))
         rendered = send.call_args.args[0]
-        self.assertIn("LONG_SESSION_WAKEUP_", rendered)
         self.assertIn("start_timer", rendered)
         self.assertIn(url, rendered)
         self.assertIn("continue work", rendered)
+        self.assertNotIn("marker", server._long_session_wakeup_results[url])
 
 
 if __name__ == "__main__":

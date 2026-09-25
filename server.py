@@ -195,9 +195,7 @@ _DEFAULT_WAKEUP_PROMPT = "Continue the previous task from where you stopped."
 
 
 def _send_registered_wakeup(conversation_url: str, prompt: str) -> None:
-    marker = f"LONG_SESSION_WAKEUP_{uuid.uuid4().hex}"
     rendered_prompt = (
-        f"{marker}\n\n"
         f"Conversation URL: {conversation_url}\n"
         "Call start_timer with the conversation URL above before continuing MCP work.\n\n"
         f"{prompt}"
@@ -205,7 +203,6 @@ def _send_registered_wakeup(conversation_url: str, prompt: str) -> None:
     with _long_session_lock:
         _long_session_wakeup_results[conversation_url] = {
             "status": "sending",
-            "marker": marker,
             "started_at_epoch_seconds": time.time(),
         }
     try:
@@ -218,14 +215,13 @@ def _send_registered_wakeup(conversation_url: str, prompt: str) -> None:
             browser_channel=CONFIG.chatgpt_browser_channel,
             headless=CONFIG.chatgpt_browser_headless,
             timeout_seconds=CONFIG.chatgpt_browser_timeout_seconds,
-            verification_markers=(marker,),
+            verification_markers=(conversation_url,),
             require_temporary_chat=False,
         )
     except Exception as exc:
         with _long_session_lock:
             _long_session_wakeup_results[conversation_url] = {
                 "status": "failed",
-                "marker": marker,
                 "finished_at_epoch_seconds": time.time(),
                 "error_type": type(exc).__name__,
                 "error": str(exc),
@@ -234,7 +230,6 @@ def _send_registered_wakeup(conversation_url: str, prompt: str) -> None:
         with _long_session_lock:
             _long_session_wakeup_results[conversation_url] = {
                 "status": "sent",
-                "marker": marker,
                 "finished_at_epoch_seconds": time.time(),
                 "browser_result": result,
             }
