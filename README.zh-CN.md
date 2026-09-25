@@ -1,8 +1,14 @@
-# OverGPT
+<p align="center">
+  <img src="assets/mcp-icon-10kb.png" alt="OverGPT icon" width="96" />
+</p>
 
-**通过 MCP 为 ChatGPT 提供持久执行与递归 sub-agent 能力。**
+<h1 align="center">OverGPT</h1>
 
-[English](README.md) · [中文](README.zh-CN.md)
+<p align="center"><strong>通过 MCP 为 ChatGPT 提供持久执行与递归 sub-agent 能力。</strong></p>
+
+<p align="center">
+  <a href="README.md">English</a> · <a href="README.zh-CN.md">中文</a>
+</p>
 
 OverGPT 是 [WebCodex](https://github.com/yyjeqhc/webcodex) 的配套增强。WebCodex 让 ChatGPT 拥有真实的开发环境；OverGPT 则让 ChatGPT 自己能够跨越单次模型执行周期继续工作，并把独立任务委派给新的 ChatGPT sub-agent。
 

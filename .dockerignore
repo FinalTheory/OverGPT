@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 .ruff_cache/
 .mcp-tasks/
+.mcp-state/
 temp/
 *.sync-conflict-*
 .git/

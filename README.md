@@ -1,8 +1,14 @@
-# OverGPT
+<p align="center">
+  <img src="assets/mcp-icon-10kb.png" alt="OverGPT icon" width="96" />
+</p>
 
-**Durable execution and recursive sub-agents for ChatGPT over MCP.**
+<h1 align="center">OverGPT</h1>
 
-[English](README.md) · [中文](README.zh-CN.md)
+<p align="center"><strong>Durable execution and recursive sub-agents for ChatGPT over MCP.</strong></p>
+
+<p align="center">
+  <a href="README.md">English</a> · <a href="README.zh-CN.md">中文</a>
+</p>
 
 OverGPT is a companion to [WebCodex](https://github.com/yyjeqhc/webcodex). WebCodex gives ChatGPT a real development environment; OverGPT lets the ChatGPT side keep working beyond one model turn and delegate work to fresh ChatGPT sub-agents.
 

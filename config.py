@@ -43,6 +43,7 @@ class Config:
     skills_dirname: str = "skills"
     draft_dirname: str = "draft"
     tasks_dirname: str = ".mcp-tasks"
+    state_dirname: str = ".mcp-state"
     draft_diff_page: Path = SOURCE_ROOT / "web" / "draft_diff.html"
     draft_commit_password: str = os.getenv(
         "MCP_DRAFT_COMMIT_PASSWORD", "change-this-password"
@@ -76,6 +77,7 @@ class Config:
     restart_delay_seconds: float = 2.0
     long_session_yield_after_seconds: int = 20 * 60
     long_session_wakeup_delay_seconds: int = 60
+    long_session_timeout_fallback_delay_seconds: int = 20 * 60
 
     chatgpt_automation_enabled: bool = _env_bool(
         "MCP_CHATGPT_AUTOMATION_ENABLED", False
@@ -104,6 +106,15 @@ class Config:
     @property
     def tasks_root(self) -> Path:
         return (self.workspace_root / self.tasks_dirname).resolve()
+
+
+    @property
+    def state_root(self) -> Path:
+        return (self.project_root / self.state_dirname).resolve()
+
+    @property
+    def long_session_event_log(self) -> Path:
+        return self.state_root / "long-session-events.jsonl"
 
 
 CONFIG = Config()
