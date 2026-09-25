@@ -8,13 +8,11 @@ GPTOvertime 是 [WebCodex](https://github.com/yyjeqhc/webcodex) 的配套增强�
 
 ## 为什么会有这个项目
 
-OpenAI Codex 已经提供了很强的 coding agent 体验，但 Codex 有自己独立的套餐使用额度，本地 Codex 消息和云端任务会共享这部分额度。
+OpenAI Codex 已经提供了很强的 coding agent 体验，但 Codex 有自己独立的套餐使用额度，本地 Codex 消息和云端任务会共享这部分额度。对于普通的 plus 订阅，这部分额度很快会消耗干净。
 
 [WebCodex](https://github.com/yyjeqhc/webcodex) 走的是另一条路径：它通过 MCP 把真实开发环境暴露给 ChatGPT。普通 ChatGPT 对话因此就可以直接读取代码库、修改文件、使用 Git、运行测试，并调用你自己机器上的开发工具。
 
-这样一来，ChatGPT 本身就可以充当 coding agent，而不需要把每个开发任务都交给 Codex。开发工作走的是当前 ChatGPT 对话和模型的使用路径，而不会消耗独立的 Codex usage allowance。
-
-这并不会让额度变成无限，也不会绕过 ChatGPT 自己的使用限制。它只是让 WebCodex 用户可以直接利用 ChatGPT + MCP 这条执行路径来做开发。
+这样一来，ChatGPT 本身就可以充当 coding agent，而不需要把每个开发任务都交给 Codex，而这种用法几乎不会遇到额度上限。
 
 WebCodex 已经很好地解决了开发环境这一侧的问题：
 
@@ -27,9 +25,9 @@ WebCodex 已经很好地解决了开发环境这一侧的问题：
 
 还剩下两个模型侧的问题。
 
-第一，ChatGPT 的单次执行 turn 仍然有边界。一个足够大的任务，可能需要的推理和工具调用超过一次 turn 能够完成的范围。
+第一，ChatGPT 的单次对话执行时长仍然有边界。一个足够大的任务，可能需要的推理和工具调用超过一次对话能够完成的范围（大概 25 分钟左右）。
 
-第二，一个对话的上下文不一定适合复杂任务中的所有分支。独立 review、验证、研究或者不同实现方案，很多时候放进新的干净上下文里效果更好。
+第二，一个对话的上下文不一定适合复杂任务中的所有分支。独立 review、验证、研究或者不同实现方案，很多时候放进新的 sub-agent 干净上下文里效果更好。
 
 GPTOvertime 主要补上这两个能力。
 

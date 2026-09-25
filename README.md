@@ -8,13 +8,11 @@ GPTOvertime is a companion to [WebCodex](https://github.com/yyjeqhc/webcodex). W
 
 ## Why this exists
 
-OpenAI Codex already provides a strong coding-agent experience, but Codex has its own plan usage allowance. Local Codex messages and cloud tasks share that allowance.
+OpenAI Codex already provides a strong coding-agent experience, but Codex has its own plan usage allowance. Local Codex messages and cloud tasks share that allowance. On a regular Plus subscription, that allowance can be used up fairly quickly.
 
 [WebCodex](https://github.com/yyjeqhc/webcodex) takes a different path: it exposes your real development environment through MCP, so an ordinary ChatGPT conversation can inspect repositories, edit files, use Git, run tests, and execute developer tools on your own machine.
 
-That means you can use ChatGPT itself as the coding agent instead of routing every coding task through Codex. The work is governed by the limits of the ChatGPT conversation and model you are using, rather than consuming the separate Codex usage allowance.
-
-This does not make usage unlimited or bypass ChatGPT limits. It simply lets WebCodex users use the ChatGPT + MCP execution path for development work.
+That means you can use ChatGPT itself as the coding agent instead of routing every coding task through Codex, and in practice this workflow rarely runs into the same kind of usage ceiling.
 
 WebCodex already solves the environment side very well:
 
@@ -27,9 +25,9 @@ WebCodex already solves the environment side very well:
 
 Two model-side problems remain.
 
-First, a ChatGPT execution turn is still bounded. A large task may need more reasoning and tool calls than one turn can finish.
+First, a single ChatGPT conversation still has a bounded execution window. A large task may need more reasoning and tool calls than one execution window can finish — roughly around 25 minutes in practice.
 
-Second, one conversation is not always the best context for every part of a complex task. Independent review, verification, research, or alternative implementations often work better in fresh contexts.
+Second, one conversation is not always the best context for every branch of a complex task. Independent review, verification, research, or alternative implementations often work better in a fresh sub-agent context.
 
 GPTOvertime fills those two gaps.
 
