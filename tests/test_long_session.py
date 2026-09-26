@@ -48,6 +48,7 @@ class LongSessionTests(unittest.TestCase):
                 wakeup.cancel()
             server._long_session_wakeups.clear()
             server._long_session_started.clear()
+            server._long_session_start_generation.clear()
             server._long_session_wakeup_results.clear()
 
     def setUp(self) -> None:
@@ -445,7 +446,7 @@ class LongSessionTests(unittest.TestCase):
         self.assertTrue(wakeup.started)
         self.assertEqual(wakeup.args, (url, "continue exactly"))
 
-    def test_wakeup_pre_send_exhaustion_schedules_long_retries(self) -> None:
+    def test_failed_wakeup_attempts_use_only_long_retries(self) -> None:
         url = "https://chatgpt.com/c/long-retry-test"
         expected_delays = server._WAKEUP_LONG_RETRY_DELAYS_SECONDS
 
@@ -453,13 +454,12 @@ class LongSessionTests(unittest.TestCase):
             patch.object(server.threading, "Timer", FakeTimer),
             patch.object(
                 chatgpt_playwright,
-                "send_prompt",
+                "run_bounded_browser_automation",
                 side_effect=chatgpt_playwright.ChatGPTPreSendError(
-                    "ChatGPT pre-send automation failed after 3 attempts"
+                    "ChatGPT pre-send automation failed after 1 attempt"
                 ),
             ),
         ):
-            # Initial wake-up exhausted its three short retries.
             server._send_registered_wakeup(url, "continue work")
             self.assertEqual(len(FakeTimer.created), 1)
             self.assertEqual(FakeTimer.created[-1].interval, expected_delays[0])
@@ -467,12 +467,7 @@ class LongSessionTests(unittest.TestCase):
                 server._long_session_wakeup_results[url]["status"],
                 "retry_scheduled",
             )
-            self.assertEqual(
-                server._long_session_wakeup_results[url]["retry_number"], 1
-            )
 
-            # Each long retry again represents one full send_prompt transaction,
-            # which itself contains the existing three short retries.
             for retry_number in range(1, len(expected_delays)):
                 with server._long_session_lock:
                     server._long_session_wakeups.pop(url, None)
@@ -484,13 +479,7 @@ class LongSessionTests(unittest.TestCase):
                     FakeTimer.created[-1].interval,
                     expected_delays[retry_number],
                 )
-                self.assertEqual(
-                    server._long_session_wakeup_results[url]["retry_number"],
-                    retry_number + 1,
-                )
 
-            # The one-hour retry is the final retry. If its three short attempts
-            # also fail, the wake-up becomes terminally failed.
             with server._long_session_lock:
                 server._long_session_wakeups.pop(url, None)
             server._send_registered_wakeup(
@@ -504,10 +493,11 @@ class LongSessionTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["retry_number"], len(expected_delays))
 
-        log_path = server._long_session_log_path(url)
         events = [
             json.loads(line)
-            for line in log_path.read_text(encoding="utf-8").splitlines()
+            for line in server._long_session_log_path(url)
+            .read_text(encoding="utf-8")
+            .splitlines()
             if line.strip()
         ]
         scheduled = [
@@ -520,10 +510,10 @@ class LongSessionTests(unittest.TestCase):
             for event in events
             if event["event"] == "wakeup_long_retry_started"
         ]
-        exhausted = [
+        failed_attempts = [
             event
             for event in events
-            if event["event"] == "wakeup_short_retries_exhausted"
+            if event["event"] == "wakeup_attempt_failed"
         ]
         self.assertEqual(
             [event["delay_seconds"] for event in scheduled],
@@ -533,23 +523,28 @@ class LongSessionTests(unittest.TestCase):
             [event["retry_number"] for event in started],
             list(range(1, len(expected_delays) + 1)),
         )
-        self.assertEqual(len(exhausted), len(expected_delays) + 1)
+        self.assertEqual(len(failed_attempts), len(expected_delays) + 1)
         self.assertTrue(events[-1]["long_retries_exhausted"])
         self.assertEqual(events[-1]["event"], "wakeup_failed")
 
-    def test_successful_long_retry_stops_retry_chain(self) -> None:
+    def test_successful_long_retry_requires_start_timer_confirmation(self) -> None:
         url = "https://chatgpt.com/c/long-retry-success"
+
+        def send_and_confirm(*args, **kwargs):
+            server.start_timer(url)
+            return {"status": "sent"}
+
         with patch.object(
             chatgpt_playwright,
-            "send_prompt",
-            return_value={"status": "sent"},
+            "run_bounded_browser_automation",
+            side_effect=send_and_confirm,
         ):
             server._send_registered_wakeup(
                 url, "continue work", long_retry_number=2
             )
 
         self.assertEqual(
-            server._long_session_wakeup_results[url]["status"], "sent"
+            server._long_session_wakeup_results[url]["status"], "confirmed"
         )
         self.assertEqual(
             server._long_session_wakeup_results[url]["retry_number"], 2
@@ -563,28 +558,91 @@ class LongSessionTests(unittest.TestCase):
         ]
         self.assertEqual(
             [event["event"] for event in events],
-            ["wakeup_long_retry_started", "wakeup_sending", "wakeup_sent"],
+            [
+                "wakeup_long_retry_started",
+                "wakeup_sending",
+                "timer_started",
+                "wakeup_submitted",
+                "wakeup_confirmed",
+            ],
         )
 
-    def test_failed_wakeup_is_retained_for_diagnostics(self) -> None:
+    def test_failed_wakeup_attempt_is_retained_as_scheduled_retry(self) -> None:
         url = "https://chatgpt.com/c/failure-test"
-        with patch.object(
-            chatgpt_playwright,
-            "send_prompt",
-            side_effect=RuntimeError("synthetic browser failure"),
+        with (
+            patch.object(server.threading, "Timer", FakeTimer),
+            patch.object(
+                chatgpt_playwright,
+                "run_bounded_browser_automation",
+                side_effect=RuntimeError("synthetic browser failure"),
+            ),
         ):
             server._send_registered_wakeup(url, "continue work")
         status = server._long_session_status(url)
-        self.assertEqual(status["last_wakeup"]["status"], "failed")
+        self.assertEqual(status["last_wakeup"]["status"], "retry_scheduled")
         self.assertEqual(status["last_wakeup"]["error_type"], "RuntimeError")
         self.assertIn("synthetic browser failure", status["last_wakeup"]["error"])
 
+    def test_submitted_but_unconfirmed_wakeup_uses_long_retry(self) -> None:
+        url = "https://chatgpt.com/c/unconfirmed-test"
+        with (
+            patch.object(server.threading, "Timer", FakeTimer),
+            patch.object(
+                chatgpt_playwright,
+                "run_bounded_browser_automation",
+                return_value={"status": "sent"},
+            ),
+            patch.object(
+                server,
+                "_wait_for_wakeup_confirmation",
+                return_value=False,
+            ),
+        ):
+            server._send_registered_wakeup(url, "continue work")
+
+        self.assertEqual(len(FakeTimer.created), 1)
+        self.assertEqual(
+            FakeTimer.created[0].interval,
+            server._WAKEUP_LONG_RETRY_DELAYS_SECONDS[0],
+        )
+        self.assertEqual(
+            server._long_session_wakeup_results[url]["status"],
+            "retry_scheduled",
+        )
+        events = [
+            json.loads(line)
+            for line in server._long_session_log_path(url)
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(
+            [event["event"] for event in events],
+            [
+                "wakeup_sending",
+                "wakeup_submitted",
+                "wakeup_attempt_failed",
+                "wakeup_long_retry_scheduled",
+            ],
+        )
+
     def test_wakeup_uses_existing_browser_automation_for_history_url(self) -> None:
         url = "https://chatgpt.com/c/history-test"
-        with patch.object(chatgpt_playwright, "send_prompt", return_value={"status": "sent"}) as send:
+
+        def send_and_confirm(*args, **kwargs):
+            server.start_timer(url)
+            return {"status": "sent"}
+
+        with patch.object(
+            chatgpt_playwright,
+            "run_bounded_browser_automation",
+            side_effect=send_and_confirm,
+        ) as send:
             server._send_registered_wakeup(url, "continue work")
         kwargs = send.call_args.kwargs
-        self.assertEqual(server._long_session_wakeup_results[url]["status"], "sent")
+        self.assertEqual(
+            server._long_session_wakeup_results[url]["status"], "confirmed"
+        )
         self.assertEqual(kwargs["url"], url)
         self.assertFalse(kwargs["require_temporary_chat"])
         self.assertEqual(kwargs["verification_markers"], (url,))

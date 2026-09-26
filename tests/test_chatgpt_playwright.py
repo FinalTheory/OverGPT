@@ -130,24 +130,31 @@ def main() -> None:
             def fail_first_fill(*args: object, **kwargs: object) -> None:
                 nonlocal fill_calls
                 fill_calls += 1
-                if fill_calls == 1:
-                    raise chatgpt_playwright.ChatGPTPreSendError("synthetic pre-send remount")
-                original_fill(*args, **kwargs)
+                raise chatgpt_playwright.ChatGPTPreSendError(
+                    "synthetic pre-send remount"
+                )
 
             with patch.object(
                 chatgpt_playwright, "_fill_verified_prompt", side_effect=fail_first_fill
             ):
-                retried = send_prompt(
-                    "browser marker",
-                    url=f"http://127.0.0.1:{retry_server.server_port}/?temporary-chat=true",
-                    profile_dir=profile,
-                    browser_channel="" if sys.platform == "linux" else "chrome",
-                    headless=True,
-                    timeout_seconds=10,
-                    verification_markers=("browser marker",),
+                try:
+                    send_prompt(
+                        "browser marker",
+                        url=f"http://127.0.0.1:{retry_server.server_port}/?temporary-chat=true",
+                        profile_dir=profile,
+                        browser_channel="" if sys.platform == "linux" else "chrome",
+                        headless=True,
+                        timeout_seconds=10,
+                        verification_markers=("browser marker",),
+                    )
+                except chatgpt_playwright.ChatGPTPreSendError:
+                    pass
+                else:
+                    raise RuntimeError("known pre-send failure was retried or swallowed")
+            if fill_calls != 1:
+                raise RuntimeError(
+                    f"pre-send browser attempt was unexpectedly retried: calls={fill_calls}"
                 )
-            if retried["status"] != "sent" or fill_calls < 2:
-                raise RuntimeError(f"known pre-send failure was not retried: {retried}")
 
             from playwright.sync_api import Error as PlaywrightError
 
@@ -686,7 +693,7 @@ def main() -> None:
                 chatgpt_playwright,
                 "reserve_browser_slot",
                 side_effect=chatgpt_playwright.ChatGPTCapacityError(
-                    "ChatGPT browser capacity is full (5 concurrent tasks)"
+                    "ChatGPT browser capacity is full (3 concurrent tasks)"
                 ),
             ),
         ):
@@ -715,7 +722,7 @@ def main() -> None:
             patch.object(
                 chatgpt_playwright,
                 "reserve_browser_slot",
-                return_value=4,
+                return_value=2,
             ),
             patch.object(
                 chatgpt_playwright,
@@ -733,7 +740,7 @@ def main() -> None:
                 pass
             else:
                 raise RuntimeError("background start failure was silently accepted")
-        mocked_release.assert_called_once_with(failed_start_task_id, 4)
+        mocked_release.assert_called_once_with(failed_start_task_id, 2)
         if failed_start_task_dir.exists():
             raise RuntimeError("failed background start left an unowned task directory")
 
@@ -748,28 +755,53 @@ def main() -> None:
             "output_path": f"mymcp/task_state/{'b' * 32}/output.md",
         }
         with patch.object(
-            server,
-            "_spawn_one_chatgpt_subagent",
-            side_effect=[
-                started_a,
-                started_b,
-                chatgpt_playwright.ChatGPTCapacityError(
-                    "ChatGPT browser capacity is full (5 concurrent tasks)"
-                ),
-            ],
-        ) as mocked_batch_spawn:
-            batch = server.spawn_chatgpt_subagents(
-                ["task a", "task b", "task c", "task d"]
-            )
+            server, "_spawn_one_chatgpt_subagent"
+        ) as mocked_oversized_batch:
+            try:
+                server.spawn_chatgpt_subagents(
+                    ["task a", "task b", "task c", "task d"]
+                )
+            except ValueError as error:
+                if "maximum batch size is 3" not in str(error):
+                    raise
+            else:
+                raise RuntimeError("oversized sub-agent batch was accepted")
+        if mocked_oversized_batch.called:
+            raise RuntimeError("oversized batch produced side effects before rejection")
+
+        with (
+            patch.object(server, "_count_active_chatgpt_subagents", return_value=4),
+            patch.object(server, "_spawn_one_chatgpt_subagent") as mocked_over_capacity,
+        ):
+            try:
+                server.spawn_chatgpt_subagents(["task a", "task b"])
+            except chatgpt_playwright.ChatGPTCapacityError as error:
+                if "global limit of 5" not in str(error):
+                    raise
+            else:
+                raise RuntimeError("global active sub-agent limit was not enforced")
+        if mocked_over_capacity.called:
+            raise RuntimeError("over-capacity batch started tasks before rejection")
+
+        with (
+            patch.object(server, "_count_active_chatgpt_subagents", return_value=0),
+            patch.object(
+                server,
+                "_spawn_one_chatgpt_subagent",
+                side_effect=[
+                    started_a,
+                    started_b,
+                    chatgpt_playwright.ChatGPTCapacityError(
+                        "ChatGPT browser capacity is full (3 concurrent tasks)"
+                    ),
+                ],
+            ) as mocked_batch_spawn,
+        ):
+            batch = server.spawn_chatgpt_subagents(["task a", "task b", "task c"])
         if batch["status"] != "partial" or batch["started"] != 2:
             raise RuntimeError(f"partial batch launch lost success state: {batch}")
         statuses = [item["status"] for item in batch["items"]]
-        if statuses != [
-            "started",
-            "started",
-            "rejected_capacity",
-            "not_started_capacity",
-        ]:
+        if statuses != ["started", "started", "rejected_capacity"]:
             raise RuntimeError(f"unexpected partial batch statuses: {batch}")
         if [
             batch["items"][0]["task_id"],

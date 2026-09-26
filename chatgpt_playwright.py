@@ -8,8 +8,10 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from time import monotonic, sleep, time
@@ -35,8 +37,8 @@ IGNORED_CHROME_DEFAULT_ARGS = ("--use-mock-keychain",)
 DEBUG_UI_HOLD_FILE = Path("/tmp/mymcp-debug-ui/hold-browser-open")
 DEBUG_UI_HOLD_SECONDS = 60
 SUBAGENT_COMPLETED_SENTINEL = "OVERGPTSUBAGENTCOMPLETE7D3A9F6C"
-SUBAGENT_CREATION_TIMEOUT_SECONDS = 300
-BROWSER_TASK_CONCURRENCY = 5
+SUBAGENT_CREATION_TIMEOUT_SECONDS = 180
+BROWSER_TASK_CONCURRENCY = 3
 TASK_PROFILES_ROOT = Path(__file__).resolve().parent / "chatgpt-task-profiles"
 
 
@@ -54,6 +56,10 @@ class ChatGPTPostSendError(RuntimeError):
 
 class ChatGPTCapacityError(RuntimeError):
     """All bounded browser profile slots are occupied or reserved."""
+
+
+class ChatGPTAutomationTimeout(RuntimeError):
+    """Hard browser-automation timeout with ambiguous Send commit state."""
 
 
 
@@ -690,7 +696,7 @@ def send_prompt(
     require_temporary_chat: bool = True,
     mcp_app_name: str | None = None,
 ) -> dict[str, Any]:
-    """Send one verified prompt with bounded retries only before Send."""
+    """Send one verified prompt exactly once; higher layers own retry policy."""
     if not prompt.strip():
         raise ValueError("prompt must not be empty")
     if require_temporary_chat and not _is_temporary_chat_url(url):
@@ -716,7 +722,7 @@ def send_prompt(
         pass
 
     timeout_ms = timeout_seconds * 1000
-    attempts = 3
+    attempts = 1
     last_error: BaseException | None = None
 
     for attempt in range(1, attempts + 1):
@@ -855,6 +861,215 @@ def send_prompt(
     ) from last_error
 
 
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _browser_automation_worker(request_path: str, response_path: str) -> None:
+    """Run one raw Playwright transaction in an isolated helper process."""
+    request = json.loads(Path(request_path).read_text(encoding="utf-8"))
+    acknowledgement_wait: Callable[[], float] | None = None
+    acknowledgement_path = request.get("acknowledgement_path")
+    if acknowledgement_path is not None:
+        baseline_value = request.get("acknowledgement_baseline")
+        baseline = (
+            tuple(int(value) for value in baseline_value)
+            if baseline_value is not None
+            else None
+        )
+        acknowledgement_file = Path(acknowledgement_path)
+        acknowledgement_timeout = int(request["acknowledgement_timeout_seconds"])
+        acknowledgement_wait = lambda: _wait_for_file_creation(
+            acknowledgement_file, baseline, acknowledgement_timeout
+        )
+
+    try:
+        result = send_prompt(
+            request["prompt"],
+            url=request["url"],
+            profile_dir=Path(request["profile_dir"]),
+            browser_channel=request["browser_channel"],
+            headless=bool(request["headless"]),
+            timeout_seconds=int(request["timeout_seconds"]),
+            verification_markers=tuple(request["verification_markers"]),
+            acknowledgement_wait=acknowledgement_wait,
+            reservation_task_id=request.get("reservation_task_id"),
+            reservation_slot=request.get("reservation_slot"),
+            require_temporary_chat=bool(request["require_temporary_chat"]),
+            mcp_app_name=request.get("mcp_app_name"),
+        )
+    except BaseException as error:
+        response = {
+            "ok": False,
+            "error_type": type(error).__name__,
+            "error": str(error),
+        }
+    else:
+        response = {"ok": True, "result": result}
+    _write_json_atomic(Path(response_path), response)
+
+
+def _terminate_browser_process_group(
+    process: subprocess.Popen[Any], grace_seconds: float = 2.0
+) -> None:
+    """Terminate the isolated helper and every Playwright/Chromium descendant."""
+    if process.poll() is not None:
+        return
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+    else:
+        process.terminate()
+    try:
+        process.wait(timeout=grace_seconds)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+    else:
+        process.kill()
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def run_bounded_browser_automation(
+    prompt: str,
+    *,
+    url: str,
+    profile_dir: Path,
+    browser_channel: str,
+    headless: bool,
+    timeout_seconds: int,
+    hard_timeout_seconds: int,
+    verification_markers: tuple[str, ...],
+    acknowledgement_path: Path | None = None,
+    acknowledgement_baseline: tuple[int, int, int] | None = None,
+    acknowledgement_timeout_seconds: int | None = None,
+    reservation_task_id: str | None = None,
+    reservation_slot: int | None = None,
+    require_temporary_chat: bool = True,
+    mcp_app_name: str | None = None,
+) -> dict[str, Any]:
+    """Run one complete browser transaction behind a process-level hard deadline."""
+    if hard_timeout_seconds < 1:
+        raise ValueError("hard_timeout_seconds must be positive")
+    if acknowledgement_path is not None and acknowledgement_timeout_seconds is None:
+        raise ValueError(
+            "acknowledgement_timeout_seconds is required with acknowledgement_path"
+        )
+
+    request = {
+        "prompt": prompt,
+        "url": url,
+        "profile_dir": str(profile_dir),
+        "browser_channel": browser_channel,
+        "headless": headless,
+        "timeout_seconds": timeout_seconds,
+        "verification_markers": list(verification_markers),
+        "acknowledgement_path": (
+            str(acknowledgement_path) if acknowledgement_path is not None else None
+        ),
+        "acknowledgement_baseline": (
+            list(acknowledgement_baseline)
+            if acknowledgement_baseline is not None
+            else None
+        ),
+        "acknowledgement_timeout_seconds": acknowledgement_timeout_seconds,
+        "reservation_task_id": reservation_task_id,
+        "reservation_slot": reservation_slot,
+        "require_temporary_chat": require_temporary_chat,
+        "mcp_app_name": mcp_app_name,
+    }
+
+    with tempfile.TemporaryDirectory(prefix="mymcp-browser-automation-") as temp_dir:
+        temp_root = Path(temp_dir)
+        request_path = temp_root / "request.json"
+        response_path = temp_root / "response.json"
+        stdout_path = temp_root / "stdout.log"
+        stderr_path = temp_root / "stderr.log"
+        _write_json_atomic(request_path, request)
+
+        worker_code = (
+            "import sys; "
+            f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r}); "
+            "from chatgpt_playwright import _browser_automation_worker; "
+            "_browser_automation_worker(sys.argv[1], sys.argv[2])"
+        )
+        with stdout_path.open("wb") as stdout_handle, stderr_path.open("wb") as stderr_handle:
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    worker_code,
+                    str(request_path),
+                    str(response_path),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                start_new_session=True,
+                close_fds=True,
+            )
+            try:
+                process.wait(timeout=hard_timeout_seconds)
+            except subprocess.TimeoutExpired as error:
+                _terminate_browser_process_group(process)
+                if reservation_task_id is not None and reservation_slot is not None:
+                    release_browser_slot(reservation_task_id, reservation_slot)
+                raise ChatGPTAutomationTimeout(
+                    "browser automation exceeded hard timeout of "
+                    f"{hard_timeout_seconds} seconds; Send commit state is ambiguous"
+                ) from error
+
+        if not response_path.is_file():
+            if reservation_task_id is not None and reservation_slot is not None:
+                release_browser_slot(reservation_task_id, reservation_slot)
+            stderr_text = stderr_path.read_text(
+                encoding="utf-8", errors="replace"
+            )[-4000:]
+            raise RuntimeError(
+                "browser automation worker exited without a response"
+                + (f": {stderr_text}" if stderr_text else "")
+            )
+
+        response = json.loads(response_path.read_text(encoding="utf-8"))
+        if response.get("ok") is True:
+            result = response.get("result")
+            if not isinstance(result, dict):
+                raise RuntimeError("browser automation worker returned an invalid result")
+            return result
+
+        if reservation_task_id is not None and reservation_slot is not None:
+            release_browser_slot(reservation_task_id, reservation_slot)
+        error_type = str(response.get("error_type") or "RuntimeError")
+        error_message = str(response.get("error") or "browser automation failed")
+        known_errors: dict[str, type[RuntimeError]] = {
+            "ChatGPTPreSendError": ChatGPTPreSendError,
+            "ChatGPTRateLimitError": ChatGPTRateLimitError,
+            "ChatGPTPostSendError": ChatGPTPostSendError,
+            "ChatGPTCapacityError": ChatGPTCapacityError,
+        }
+        error_class = known_errors.get(error_type)
+        if error_class is not None:
+            raise error_class(error_message)
+        raise RuntimeError(f"{error_type}: {error_message}")
+
+
 def _find_chrome_executable(configured: str) -> Path:
     if configured:
         executable = Path(configured).expanduser().resolve()
@@ -960,28 +1175,23 @@ def send_subagent_task(
         )
         output_baseline = _file_signature(output_file)
 
-    result = send_prompt(
+    result = run_bounded_browser_automation(
         prompt,
         url=CONFIG.chatgpt_url,
         profile_dir=CONFIG.chatgpt_profile_dir,
         browser_channel=CONFIG.chatgpt_browser_channel,
         headless=CONFIG.chatgpt_browser_headless,
         timeout_seconds=CONFIG.chatgpt_browser_timeout_seconds,
+        hard_timeout_seconds=CONFIG.chatgpt_browser_hard_timeout_seconds,
         verification_markers=(
             normalized_input,
             normalized_output,
             SUBAGENT_COMPLETED_SENTINEL,
         ),
-        acknowledgement_wait=(
-            (
-                lambda: _wait_for_file_creation(
-                    output_file,
-                    output_baseline,
-                    SUBAGENT_CREATION_TIMEOUT_SECONDS,
-                )
-            )
-            if output_file is not None
-            else None
+        acknowledgement_path=output_file,
+        acknowledgement_baseline=output_baseline,
+        acknowledgement_timeout_seconds=(
+            SUBAGENT_CREATION_TIMEOUT_SECONDS if output_file is not None else None
         ),
         reservation_task_id=task_id if reservation_slot is not None else None,
         reservation_slot=reservation_slot,

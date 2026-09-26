@@ -35,7 +35,9 @@ from starlette.responses import HTMLResponse, JSONResponse, Response
 from config import CONFIG
 
 _long_session_lock = threading.RLock()
+_long_session_condition = threading.Condition(_long_session_lock)
 _long_session_started: dict[str, float] = {}
+_long_session_start_generation: dict[str, int] = {}
 _long_session_wakeups: dict[str, threading.Timer] = {}
 _long_session_wakeup_results: dict[str, dict[str, Any]] = {}
 _long_session_log_lock = threading.RLock()
@@ -390,9 +392,12 @@ mcp = LongSessionFastMCP(
         "shell rm/mv. Use run_workspace_code(background=true) for "
         "long-running commands, then poll get_workspace_task with the returned task_id; background "
         "commands default to a one-hour timeout. Delegate ChatGPT sub-agents only through "
-        "spawn_chatgpt_subagents, passing a one-element list for a single task or multiple "
-        "independent tasks in one batch so partial capacity/start failures still "
-        "return every task ID that was already created. Preserve each separately returned "
+        "spawn_chatgpt_subagents, passing a one-element list for a single task or up to "
+        f"{CONFIG.chatgpt_subagent_max_batch_size} independent tasks in one batch. The server "
+        f"also enforces at most {CONFIG.chatgpt_subagent_max_active} active ChatGPT sub-agents "
+        "globally; if either limit would be exceeded, reduce the batch or wait for existing "
+        "sub-agents to finish. Partial browser-capacity/start failures still return every "
+        "task ID that was already created. Preserve each separately returned "
         "output_path as the sub-agent's result file; stdout_path and stderr_path are execution "
         "logs. Call get_workspace_task with its defaults: it waits server-side for up to 30 "
         "seconds, returning sooner when the task finishes. If a task fails or times out, read "
@@ -425,6 +430,7 @@ mcp = LongSessionFastMCP(
 )
 
 _workspace_write_lock = threading.RLock()
+_chatgpt_subagent_admission_lock = threading.RLock()
 
 _DEFAULT_WAKEUP_PROMPT = "Continue the previous task from where you stopped."
 
@@ -434,7 +440,7 @@ _TIMEOUT_FALLBACK_WAKEUP_PROMPT = (
     "task completed; if it did not, continue from the latest safe checkpoint. If it did complete, "
     "report completion and stop."
 )
-_WAKEUP_LONG_RETRY_DELAYS_SECONDS = (5 * 60, 10 * 60, 20 * 60, 30 * 60, 60 * 60)
+_WAKEUP_LONG_RETRY_DELAYS_SECONDS = (5 * 60, 10 * 60, 20 * 60, 60 * 60)
 
 
 def _schedule_long_session_wakeup(
@@ -530,7 +536,7 @@ def _schedule_wakeup_send_retry(
     retry_number: int,
     error: BaseException,
 ) -> bool:
-    """Schedule the next safe pre-send retry without resurrecting a superseded wake-up."""
+    """Schedule the next whole wake-up attempt without resurrecting a superseded wake-up."""
     if not 1 <= retry_number <= len(_WAKEUP_LONG_RETRY_DELAYS_SECONDS):
         return False
 
@@ -579,6 +585,22 @@ def _schedule_wakeup_send_retry(
     return True
 
 
+def _wait_for_wakeup_confirmation(
+    conversation_url: str,
+    baseline_generation: int,
+    timeout_seconds: int,
+) -> bool:
+    """Wait until this conversation calls start_timer after one wake-up attempt."""
+    deadline = time.monotonic() + timeout_seconds
+    with _long_session_condition:
+        while _long_session_start_generation.get(conversation_url, 0) <= baseline_generation:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            _long_session_condition.wait(timeout=remaining)
+        return True
+
+
 def _send_registered_wakeup(
     conversation_url: str,
     prompt: str,
@@ -596,11 +618,13 @@ def _send_registered_wakeup(
             _long_session_wakeup_results.get(conversation_url, {})
         )
         wakeup_kind = previous_result.get("kind", "unknown")
+        baseline_generation = _long_session_start_generation.get(conversation_url, 0)
         _long_session_wakeup_results[conversation_url] = {
             "status": "sending",
             "kind": wakeup_kind,
             "started_at_epoch_seconds": time.time(),
             "retry_number": long_retry_number,
+            "baseline_start_generation": baseline_generation,
         }
 
     if long_retry_number:
@@ -618,22 +642,76 @@ def _send_registered_wakeup(
     )
 
     try:
-        from chatgpt_playwright import ChatGPTPreSendError, send_prompt
+        from chatgpt_playwright import run_bounded_browser_automation
 
-        result = send_prompt(
+        result = run_bounded_browser_automation(
             rendered_prompt,
             url=conversation_url,
             profile_dir=CONFIG.chatgpt_profile_dir,
             browser_channel=CONFIG.chatgpt_browser_channel,
             headless=CONFIG.chatgpt_browser_headless,
             timeout_seconds=CONFIG.chatgpt_browser_timeout_seconds,
+            hard_timeout_seconds=CONFIG.chatgpt_browser_hard_timeout_seconds,
             verification_markers=(conversation_url,),
             require_temporary_chat=False,
             mcp_app_name=CONFIG.chatgpt_mcp_app_name,
         )
-    except ChatGPTPreSendError as exc:
+
+        with _long_session_lock:
+            already_confirmed = (
+                _long_session_start_generation.get(conversation_url, 0)
+                > baseline_generation
+            )
+            if not already_confirmed:
+                _long_session_wakeup_results[conversation_url] = {
+                    "status": "awaiting_confirmation",
+                    "kind": wakeup_kind,
+                    "submitted_at_epoch_seconds": time.time(),
+                    "retry_number": long_retry_number,
+                    "baseline_start_generation": baseline_generation,
+                    "browser_result": result,
+                }
         _append_long_session_event(
-            "wakeup_short_retries_exhausted",
+            "wakeup_submitted",
+            conversation_url,
+            wakeup_kind=wakeup_kind,
+            retry_number=long_retry_number,
+            browser_status=result.get("status"),
+        )
+
+        confirmed = already_confirmed or _wait_for_wakeup_confirmation(
+            conversation_url,
+            baseline_generation,
+            CONFIG.long_session_wakeup_confirmation_timeout_seconds,
+        )
+        if not confirmed:
+            raise TimeoutError(
+                "wakeup message was submitted but start_timer was not called within "
+                f"{CONFIG.long_session_wakeup_confirmation_timeout_seconds} seconds"
+            )
+
+        with _long_session_lock:
+            confirmation_generation = _long_session_start_generation.get(
+                conversation_url, 0
+            )
+            _long_session_wakeup_results[conversation_url] = {
+                "status": "confirmed",
+                "kind": wakeup_kind,
+                "finished_at_epoch_seconds": time.time(),
+                "retry_number": long_retry_number,
+                "browser_result": result,
+                "start_generation": confirmation_generation,
+            }
+        _append_long_session_event(
+            "wakeup_confirmed",
+            conversation_url,
+            wakeup_kind=wakeup_kind,
+            retry_number=long_retry_number,
+            start_generation=confirmation_generation,
+        )
+    except Exception as exc:
+        _append_long_session_event(
+            "wakeup_attempt_failed",
             conversation_url,
             wakeup_kind=wakeup_kind,
             retry_number=long_retry_number,
@@ -651,6 +729,19 @@ def _send_registered_wakeup(
             return
 
         with _long_session_lock:
+            if (
+                _long_session_start_generation.get(conversation_url, 0)
+                > baseline_generation
+            ):
+                return
+            owner = threading.current_thread()
+            current = _long_session_wakeups.get(conversation_url)
+            superseded = (
+                (isinstance(owner, threading.Timer) and current is not owner)
+                or (not isinstance(owner, threading.Timer) and current is not None)
+            )
+            if superseded:
+                return
             _long_session_wakeup_results[conversation_url] = {
                 "status": "failed",
                 "kind": wakeup_kind,
@@ -670,41 +761,6 @@ def _send_registered_wakeup(
             error_type=type(exc).__name__,
             error=str(exc)[:1000],
         )
-    except Exception as exc:
-        # Rate-limit and any post-Send/ambiguous failures retain their existing
-        # semantics: they are not safe members of the automatic resend chain.
-        with _long_session_lock:
-            _long_session_wakeup_results[conversation_url] = {
-                "status": "failed",
-                "kind": wakeup_kind,
-                "finished_at_epoch_seconds": time.time(),
-                "retry_number": long_retry_number,
-                "error_type": type(exc).__name__,
-                "error": str(exc),
-            }
-        _append_long_session_event(
-            "wakeup_failed",
-            conversation_url,
-            wakeup_kind=wakeup_kind,
-            retry_number=long_retry_number,
-            error_type=type(exc).__name__,
-            error=str(exc)[:1000],
-        )
-    else:
-        with _long_session_lock:
-            _long_session_wakeup_results[conversation_url] = {
-                "status": "sent",
-                "kind": wakeup_kind,
-                "finished_at_epoch_seconds": time.time(),
-                "retry_number": long_retry_number,
-                "browser_result": result,
-            }
-        _append_long_session_event(
-            "wakeup_sent",
-            conversation_url,
-            wakeup_kind=wakeup_kind,
-            retry_number=long_retry_number,
-        )
     finally:
         with _long_session_lock:
             current = _long_session_wakeups.get(conversation_url)
@@ -716,18 +772,33 @@ def _send_registered_wakeup(
 def start_timer(conversation_url: str) -> dict[str, Any]:
     """Start or restart server-authoritative long-session timing for one ChatGPT conversation."""
     normalized = _validate_conversation_url(conversation_url)
-    with _long_session_lock:
+    with _long_session_condition:
         _long_session_started[normalized] = time.monotonic()
+        generation = _long_session_start_generation.get(normalized, 0) + 1
+        _long_session_start_generation[normalized] = generation
         pending = _long_session_wakeups.pop(normalized, None)
         pending_result = dict(_long_session_wakeup_results.get(normalized, {}))
         pending_kind = pending_result.get("kind") if pending is not None else None
         if pending is not None:
             pending.cancel()
-            _long_session_wakeup_results[normalized] = {
-                "status": "cancelled_by_start_timer",
-                "kind": pending_kind,
-                "finished_at_epoch_seconds": time.time(),
-            }
+            if pending_result.get("status") in {
+                "sending",
+                "awaiting_confirmation",
+            }:
+                _long_session_wakeup_results[normalized] = {
+                    "status": "confirmed",
+                    "kind": pending_kind,
+                    "finished_at_epoch_seconds": time.time(),
+                    "retry_number": pending_result.get("retry_number", 0),
+                    "start_generation": generation,
+                }
+            else:
+                _long_session_wakeup_results[normalized] = {
+                    "status": "cancelled_by_start_timer",
+                    "kind": pending_kind,
+                    "finished_at_epoch_seconds": time.time(),
+                }
+        _long_session_condition.notify_all()
     _append_long_session_event(
         "timer_started",
         normalized,
@@ -2100,23 +2171,46 @@ def _spawn_one_chatgpt_subagent(task: str) -> dict[str, Any]:
     }
 
 
+def _count_active_chatgpt_subagents() -> int:
+    """Reconcile persisted task state and count live delegated ChatGPT tasks."""
+    if not CONFIG.tasks_root.is_dir():
+        return 0
+
+    active = 0
+    for task_dir in CONFIG.tasks_root.iterdir():
+        if (
+            not re.fullmatch(r"[0-9a-f]{32}", task_dir.name)
+            or task_dir.is_symlink()
+            or not task_dir.is_dir()
+        ):
+            continue
+        status_path = task_dir / "status.json"
+        if not status_path.is_file():
+            continue
+
+        status = _read_task_json(status_path)
+        if status.get("kind") != "chatgpt_subagent":
+            continue
+        if status.get("status") in {"queued", "running"}:
+            status = _recover_workspace_task(task_dir, f"task_{task_dir.name}")
+        if status.get("status") in {"queued", "running"}:
+            active += 1
+    return active
+
+
 @mcp.tool()
 def spawn_chatgpt_subagents(tasks: list[str]) -> dict[str, Any]:
     """Safely start a bounded batch of independent ChatGPT Web sub-agents.
 
-    Every input is validated before any side effect. If a later item reaches browser
-    capacity after earlier items have already started, the tool returns all started
-    task IDs plus structured rejection state instead of aborting the whole call.
+    The complete batch is rejected before side effects when either the per-call
+    batch limit or the global active-sub-agent limit would be exceeded.
     """
     if not isinstance(tasks, list) or not tasks:
         raise ValueError("tasks must be a non-empty list of task strings")
-
-    from chatgpt_playwright import BROWSER_TASK_CONCURRENCY, ChatGPTCapacityError
-
-    if len(tasks) > BROWSER_TASK_CONCURRENCY:
+    if len(tasks) > CONFIG.chatgpt_subagent_max_batch_size:
         raise ValueError(
-            f"batch contains {len(tasks)} tasks but browser concurrency is "
-            f"{BROWSER_TASK_CONCURRENCY}"
+            f"batch contains {len(tasks)} tasks but the maximum batch size is "
+            f"{CONFIG.chatgpt_subagent_max_batch_size}; reduce the batch and retry"
         )
 
     # Validate the whole request before starting any task. A malformed later item
@@ -2124,80 +2218,99 @@ def spawn_chatgpt_subagents(tasks: list[str]) -> dict[str, Any]:
     for task in tasks:
         _validate_chatgpt_subagent_task(task)
 
-    items: list[dict[str, Any]] = []
-    started = 0
-    stop_reason: str | None = None
+    from chatgpt_playwright import ChatGPTCapacityError
 
-    for index, task in enumerate(tasks):
-        if stop_reason is not None:
+    # Serialize admission so two concurrent spawn calls cannot both observe the
+    # same free global capacity and oversubscribe the active-sub-agent limit.
+    with _chatgpt_subagent_admission_lock:
+        active_before = _count_active_chatgpt_subagents()
+        requested = len(tasks)
+        if active_before + requested > CONFIG.chatgpt_subagent_max_active:
+            available = max(0, CONFIG.chatgpt_subagent_max_active - active_before)
+            raise ChatGPTCapacityError(
+                f"{active_before} ChatGPT sub-agents are currently active; accepting "
+                f"{requested} more would exceed the global limit of "
+                f"{CONFIG.chatgpt_subagent_max_active}. At most {available} additional "
+                "sub-agent(s) can be started now; reduce the batch or wait for existing "
+                "sub-agents to finish."
+            )
+
+        items: list[dict[str, Any]] = []
+        started = 0
+        stop_reason: str | None = None
+
+        for index, task in enumerate(tasks):
+            if stop_reason is not None:
+                items.append(
+                    {
+                        "index": index,
+                        "status": stop_reason,
+                        "task_id": None,
+                    }
+                )
+                continue
+
+            try:
+                result = _spawn_one_chatgpt_subagent(task)
+            except ChatGPTCapacityError as exc:
+                items.append(
+                    {
+                        "index": index,
+                        "status": "rejected_capacity",
+                        "task_id": None,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    }
+                )
+                stop_reason = "not_started_capacity"
+                continue
+            except Exception as exc:
+                # Before any task starts, retain the existing loud failure behavior.
+                # After partial success, never throw away the only handles to already
+                # running tasks; return the start failure alongside those handles.
+                if started == 0:
+                    raise
+                items.append(
+                    {
+                        "index": index,
+                        "status": "failed_to_start",
+                        "task_id": None,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    }
+                )
+                stop_reason = "not_started_after_error"
+                continue
+
+            started += 1
             items.append(
                 {
+                    **result,
                     "index": index,
-                    "status": stop_reason,
-                    "task_id": None,
+                    "task_status": result.get("status"),
+                    "status": "started",
                 }
             )
-            continue
 
-        try:
-            result = _spawn_one_chatgpt_subagent(task)
-        except ChatGPTCapacityError as exc:
-            items.append(
-                {
-                    "index": index,
-                    "status": "rejected_capacity",
-                    "task_id": None,
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                }
-            )
-            stop_reason = "not_started_capacity"
-            continue
-        except Exception as exc:
-            # Before any task starts, retain the existing loud failure behavior.
-            # After partial success, never throw away the only handles to already
-            # running tasks; return the start failure alongside those handles.
-            if started == 0:
-                raise
-            items.append(
-                {
-                    "index": index,
-                    "status": "failed_to_start",
-                    "task_id": None,
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                }
-            )
-            stop_reason = "not_started_after_error"
-            continue
+        if started == len(tasks):
+            batch_status = "all_started"
+        elif started == 0:
+            batch_status = "none_started"
+        else:
+            batch_status = "partial"
 
-        started += 1
-        items.append(
-            {
-                **result,
-                "index": index,
-                "task_status": result.get("status"),
-                "status": "started",
-            }
-        )
-
-    if started == len(tasks):
-        batch_status = "all_started"
-    elif started == 0:
-        batch_status = "none_started"
-    else:
-        batch_status = "partial"
-
-    return {
-        "status": batch_status,
-        "requested": len(tasks),
-        "started": started,
-        "items": items,
-        "message": (
-            "Batch launch completed; preserve task_id/output_path from every "
-            "item whose status is started."
-        ),
-    }
+        return {
+            "status": batch_status,
+            "requested": len(tasks),
+            "started": started,
+            "active_before": active_before,
+            "active_limit": CONFIG.chatgpt_subagent_max_active,
+            "items": items,
+            "message": (
+                "Batch launch completed; preserve task_id/output_path from every "
+                "item whose status is started."
+            ),
+        }
 
 
 @mcp.tool()
