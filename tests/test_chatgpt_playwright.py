@@ -843,7 +843,7 @@ def main() -> None:
         with (
             patch.object(
                 chatgpt_playwright,
-                "send_prompt",
+                "run_bounded_browser_automation",
                 return_value={
                     "status": "sent",
                     "page_url": "https://chatgpt.com/?temporary-chat=true",
@@ -864,8 +864,8 @@ def main() -> None:
         ):
             chatgpt_playwright.main()
         markers = mocked_cli_send.call_args.kwargs["verification_markers"]
-        if mocked_cli_send.call_args.kwargs["mcp_app_name"] != server.CONFIG.chatgpt_mcp_app_name:
-            raise RuntimeError("sub-agent send did not attach the configured MCP app")
+        if "mcp_app_name" in mocked_cli_send.call_args.kwargs:
+            raise RuntimeError("sub-agent send still passed obsolete MCP UI attachment state")
         if (
             delegated["input_path"] not in markers
             or delegated["output_path"] not in markers

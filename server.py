@@ -608,7 +608,7 @@ def _send_registered_wakeup(
 ) -> None:
     rendered_prompt = (
         f"Conversation URL: {conversation_url}\n"
-        f"The attached MCP app is {CONFIG.chatgpt_mcp_app_name}. Before doing any other "
+        f"The connected MCP app is {CONFIG.chatgpt_mcp_app_name}. Before doing any other "
         "MCP work, call its start_timer tool with the conversation URL above. Only after "
         "that call succeeds, continue the previous task.\n\n"
         f"{prompt}"
@@ -654,7 +654,6 @@ def _send_registered_wakeup(
             hard_timeout_seconds=CONFIG.chatgpt_browser_hard_timeout_seconds,
             verification_markers=(conversation_url,),
             require_temporary_chat=False,
-            mcp_app_name=CONFIG.chatgpt_mcp_app_name,
         )
 
         with _long_session_lock:

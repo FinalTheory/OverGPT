@@ -646,7 +646,7 @@ class LongSessionTests(unittest.TestCase):
         self.assertEqual(kwargs["url"], url)
         self.assertFalse(kwargs["require_temporary_chat"])
         self.assertEqual(kwargs["verification_markers"], (url,))
-        self.assertEqual(kwargs["mcp_app_name"], server.CONFIG.chatgpt_mcp_app_name)
+        self.assertNotIn("mcp_app_name", kwargs)
         rendered = send.call_args.args[0]
         self.assertIn("start_timer", rendered)
         self.assertIn(server.CONFIG.chatgpt_mcp_app_name, rendered)

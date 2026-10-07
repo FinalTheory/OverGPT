@@ -484,135 +484,6 @@ def _fill_verified_prompt(
 
 
 
-def _attach_mcp_app_and_fill_verified_prompt(
-    page: Any,
-    prompt: str,
-    markers: tuple[str, ...],
-    app_name: str,
-    timeout_ms: int,
-) -> None:
-    """Select one ChatGPT MCP app by @mention, then append and verify the prompt.
-
-    The app mention must be created by ChatGPT's own suggestion UI. Injecting the
-    rendered DOM is insufficient because the editor's internal state owns the
-    attachment metadata submitted with the message.
-    """
-    app_name = app_name.strip()
-    if not app_name:
-        raise ValueError("mcp app name must not be empty")
-
-    deadline = monotonic() + timeout_ms / 1000
-    last_reason = "composer did not become available"
-    while monotonic() < deadline:
-        remaining_ms = round((deadline - monotonic()) * 1000)
-        composer = _find_composer(page, min(1500, max(1, remaining_ms)))
-        if composer is None:
-            page.wait_for_timeout(150)
-            continue
-
-        handle = composer.element_handle()
-        page.wait_for_timeout(300)
-        try:
-            if handle is None or not handle.evaluate("(e) => e.isConnected"):
-                last_reason = "composer remounted before app selection"
-                continue
-        except Exception:
-            last_reason = "composer remounted before app selection"
-            continue
-
-        # Restart from a clean composer so a failed suggestion attempt cannot leave
-        # literal @text or a stale app mention behind.
-        composer.fill("")
-        composer.click()
-        page.keyboard.type(f"@{app_name}", delay=120)
-
-        candidate = page.locator(
-            'button[data-list-navigation-item="true"][aria-current="true"]'
-        )
-        candidate_deadline = min(deadline, monotonic() + 20)
-        selected = False
-        while monotonic() < candidate_deadline:
-            try:
-                if candidate.count() > 0 and candidate.first.is_visible():
-                    candidate_text = " ".join(candidate.first.inner_text().split())
-                    if app_name.casefold() in candidate_text.casefold():
-                        page.keyboard.press("Enter")
-                        selected = True
-                        break
-                    last_reason = (
-                        f"highlighted app candidate {candidate_text!r} did not match "
-                        f"configured app {app_name!r}"
-                    )
-            except Exception:
-                pass
-            page.wait_for_timeout(150)
-
-        if not selected:
-            page.keyboard.press("Escape")
-            last_reason = f"configured MCP app {app_name!r} did not become selectable"
-            continue
-
-        mention_deadline = min(deadline, monotonic() + 5)
-        mention = None
-        while monotonic() < mention_deadline:
-            current = _find_composer(page, 250)
-            if current is None:
-                break
-            mentions = current.locator('span[app-mention-path^="app://"]')
-            try:
-                if mentions.count() == 1:
-                    display_name = (
-                        mentions.first.get_attribute("app-mention-display-name") or ""
-                    )
-                    if display_name.casefold() == app_name.casefold():
-                        mention = mentions.first
-                        break
-                    last_reason = (
-                        f"selected app mention {display_name!r} did not match configured "
-                        f"app {app_name!r}"
-                    )
-            except Exception:
-                pass
-            page.wait_for_timeout(100)
-
-        if mention is None:
-            last_reason = f"ChatGPT did not create the {app_name!r} app mention"
-            continue
-
-        # Selecting the app leaves the caret after the non-editable mention node.
-        # Put the delegated prompt on its own line while preserving the mention node.
-        page.keyboard.press("Shift+Enter")
-        page.keyboard.insert_text(prompt)
-        page.wait_for_timeout(400)
-        current = _find_composer(page, min(1000, max(1, remaining_ms)))
-        if current is None:
-            last_reason = "composer remounted after app selection"
-            continue
-        text = current.inner_text()
-        missing = [marker for marker in markers if marker not in text]
-        mentions = current.locator('span[app-mention-path^="app://"]')
-        try:
-            mention_ok = (
-                mentions.count() == 1
-                and (
-                    mentions.first.get_attribute("app-mention-display-name") or ""
-                ).casefold()
-                == app_name.casefold()
-            )
-        except Exception:
-            mention_ok = False
-        if not missing and mention_ok:
-            return
-        last_reason = (
-            f"prompt verification failed after selecting {app_name!r}; "
-            f"missing markers: {missing}, mention_ok={mention_ok}"
-        )
-        page.wait_for_timeout(150)
-
-    raise ChatGPTPreSendError(
-        f"could not attach configured MCP app {app_name!r} before Send: {last_reason}"
-    )
-
 def _is_temporary_chat_url(url: str) -> bool:
     query = urlparse(url).query
     return any(
@@ -694,7 +565,6 @@ def send_prompt(
     reservation_task_id: str | None = None,
     reservation_slot: int | None = None,
     require_temporary_chat: bool = True,
-    mcp_app_name: str | None = None,
 ) -> dict[str, Any]:
     """Send one verified prompt exactly once; higher layers own retry policy."""
     if not prompt.strip():
@@ -745,18 +615,9 @@ def send_prompt(
                     try:
                         page = context.pages[0] if context.pages else context.new_page()
                         page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-                        if mcp_app_name is not None:
-                            _attach_mcp_app_and_fill_verified_prompt(
-                                page,
-                                prompt,
-                                verification_markers,
-                                mcp_app_name,
-                                timeout_ms,
-                            )
-                        else:
-                            _fill_verified_prompt(
-                                page, prompt, verification_markers, timeout_ms
-                            )
+                        _fill_verified_prompt(
+                            page, prompt, verification_markers, timeout_ms
+                        )
                         if require_temporary_chat and not _is_temporary_chat_url(page.url):
                             raise ChatGPTPreSendError(
                                 "ChatGPT left Temporary Chat before sending"
@@ -903,7 +764,6 @@ def _browser_automation_worker(request_path: str, response_path: str) -> None:
             reservation_task_id=request.get("reservation_task_id"),
             reservation_slot=request.get("reservation_slot"),
             require_temporary_chat=bool(request["require_temporary_chat"]),
-            mcp_app_name=request.get("mcp_app_name"),
         )
     except BaseException as error:
         response = {
@@ -963,7 +823,6 @@ def run_bounded_browser_automation(
     reservation_task_id: str | None = None,
     reservation_slot: int | None = None,
     require_temporary_chat: bool = True,
-    mcp_app_name: str | None = None,
 ) -> dict[str, Any]:
     """Run one complete browser transaction behind a process-level hard deadline."""
     if hard_timeout_seconds < 1:
@@ -993,7 +852,6 @@ def run_bounded_browser_automation(
         "reservation_task_id": reservation_task_id,
         "reservation_slot": reservation_slot,
         "require_temporary_chat": require_temporary_chat,
-        "mcp_app_name": mcp_app_name,
     }
 
     with tempfile.TemporaryDirectory(prefix="mymcp-browser-automation-") as temp_dir:
@@ -1195,7 +1053,6 @@ def send_subagent_task(
         ),
         reservation_task_id=task_id if reservation_slot is not None else None,
         reservation_slot=reservation_slot,
-        mcp_app_name=CONFIG.chatgpt_mcp_app_name,
     )
     if output_file is not None:
         waited = _wait_for_file_completion(
