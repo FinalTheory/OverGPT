@@ -107,6 +107,32 @@ def _clone_browser_profile(source: Path, destination: Path) -> None:
         )
 
 
+def _browser_profile_initialized(profile_dir: Path) -> bool:
+    """Return whether a persistent slot profile has a complete Chromium seed."""
+    if not (profile_dir / "Local State").is_file():
+        return False
+    try:
+        return any(
+            candidate.is_dir() and (candidate / "Preferences").is_file()
+            for candidate in profile_dir.iterdir()
+        )
+    except OSError:
+        return False
+
+
+def _clear_stale_browser_runtime_files(profile_dir: Path) -> None:
+    """Remove Chromium process-lock artifacts before reusing an idle slot profile."""
+    for name in ("SingletonCookie", "SingletonLock", "SingletonSocket", "DevToolsActivePort"):
+        path = profile_dir / name
+        try:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def _slot_directory(index: int) -> Path:
     if not 0 <= index < BROWSER_TASK_CONCURRENCY:
         raise ValueError("browser slot index is out of range")
@@ -217,7 +243,7 @@ def _browser_task_profile(
     reservation_task_id: str | None = None,
     reservation_slot: int | None = None,
 ) -> Iterator[Path]:
-    """Lease one bounded repo-local profile slot."""
+    """Lease one bounded persistent browser identity backed by a profile slot."""
     TASK_PROFILES_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
     reserved = reservation_task_id is not None or reservation_slot is not None
     if reserved and (reservation_task_id is None or reservation_slot is None):
@@ -250,14 +276,21 @@ def _browser_task_profile(
                 raise RuntimeError("browser slot reservation is missing or owned by another task")
             if not reserved and reservation is not None:
                 continue
-            if profile_dir.exists():
+
+            if profile_dir.exists() and not _browser_profile_initialized(profile_dir):
                 shutil.rmtree(profile_dir)
-            with _browser_profile_lock(source):
-                _clone_browser_profile(source, profile_dir)
+            if not profile_dir.exists():
+                with _browser_profile_lock(source):
+                    _clone_browser_profile(source, profile_dir)
+
+            # The slot lock proves no live browser owned by this harness is using the
+            # profile. Hard-killed Chromium processes can leave singleton artifacts
+            # behind, so clear those before starting the next browser on this identity.
+            _clear_stale_browser_runtime_files(profile_dir)
             yield profile_dir
         finally:
-            if profile_dir.exists():
-                shutil.rmtree(profile_dir)
+            # Keep profile state across tasks so each slot accumulates stable browser
+            # history, cookies, local storage, and challenge/trust state over time.
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
             lock_handle.close()
         return

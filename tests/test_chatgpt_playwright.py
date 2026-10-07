@@ -276,8 +276,22 @@ def main() -> None:
                     raise RuntimeError("browser task did not use a bounded profile slot")
                 if not leased_profile.joinpath("Default", "Cookies").is_file():
                     raise RuntimeError("leased browser profile omitted session state")
-            if leased_profile.exists():
-                raise RuntimeError("leased browser profile was not cleaned up")
+                leased_profile.joinpath("Default", "continuity-marker").write_text(
+                    "persistent", encoding="utf-8"
+                )
+                leased_profile.joinpath("SingletonLock").write_text(
+                    "stale", encoding="utf-8"
+                )
+            if not leased_profile.exists():
+                raise RuntimeError("leased browser profile did not persist across tasks")
+
+            with chatgpt_playwright._browser_task_profile(source) as reused_profile:
+                if reused_profile != leased_profile:
+                    raise RuntimeError("browser slot did not preserve its browser identity")
+                if reused_profile.joinpath("SingletonLock").exists():
+                    raise RuntimeError("stale Chromium runtime lock survived profile reuse")
+                if not reused_profile.joinpath("Default", "continuity-marker").is_file():
+                    raise RuntimeError("persistent browser state was lost between tasks")
 
             reservations: list[tuple[str, int]] = []
             for index in range(chatgpt_playwright.BROWSER_TASK_CONCURRENCY):
