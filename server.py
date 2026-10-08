@@ -242,11 +242,12 @@ class LongSessionFastMCP(FastMCP):
                         wakeup_result = dict(
                             _long_session_wakeup_results.get(conversation_url, {})
                         )
-                    wakeup_delivered = (
-                        not wakeup_pending
-                        and wakeup_result.get("status") == "sent"
+                    wakeup_authorized_restart = (
+                        wakeup_pending
+                        and wakeup_result.get("status")
+                        in {"sending", "awaiting_confirmation"}
                     )
-                    if not wakeup_delivered:
+                    if not wakeup_authorized_restart:
                         fallback_wakeup = _ensure_timeout_fallback_wakeup(
                             conversation_url
                         )
@@ -260,17 +261,23 @@ class LongSessionFastMCP(FastMCP):
                                 "delay_seconds"
                             ),
                         )
-                        return [
-                            TextContent(
-                                type="text",
-                                text=_long_session_stop_message(
-                                    conversation_url,
-                                    tool_name=name,
-                                    completed_before_timeout_check=False,
-                                    fallback_wakeup=fallback_wakeup,
-                                ),
-                            )
-                        ]
+                        stop_text = _long_session_stop_message(
+                            conversation_url,
+                            tool_name=name,
+                            completed_before_timeout_check=False,
+                            fallback_wakeup=fallback_wakeup,
+                        )
+                        return (
+                            [TextContent(type="text", text=stop_text)],
+                            {
+                                "status": "blocked_timeout",
+                                "executed": False,
+                                "tool_name": name,
+                                "message": stop_text,
+                                "long_session": current,
+                                "fallback_wakeup": fallback_wakeup,
+                            },
+                        )
 
             return await super().call_tool(name, forwarded)
 
@@ -298,17 +305,23 @@ class LongSessionFastMCP(FastMCP):
                 fallback_scheduled_now=fallback_wakeup.get("scheduled_now", False),
                 fallback_delay_seconds=fallback_wakeup.get("delay_seconds"),
             )
-            return [
-                TextContent(
-                    type="text",
-                    text=_long_session_stop_message(
-                        conversation_url,
-                        tool_name=name,
-                        completed_before_timeout_check=False,
-                        fallback_wakeup=fallback_wakeup,
-                    ),
-                )
-            ]
+            stop_text = _long_session_stop_message(
+                conversation_url,
+                tool_name=name,
+                completed_before_timeout_check=False,
+                fallback_wakeup=fallback_wakeup,
+            )
+            return (
+                [TextContent(type="text", text=stop_text)],
+                {
+                    "status": "blocked_timeout",
+                    "executed": False,
+                    "tool_name": name,
+                    "message": stop_text,
+                    "long_session": before,
+                    "fallback_wakeup": fallback_wakeup,
+                },
+            )
 
         if before.get("tracked"):
             _append_long_session_event(

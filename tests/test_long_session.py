@@ -149,13 +149,18 @@ class LongSessionTests(unittest.TestCase):
             )
 
         read.assert_not_called()
-        self.assertIsInstance(result, list)
-        self.assertEqual(len(result), 1)
-        text = result[0].text
+        self.assertIsInstance(result, tuple)
+        content, structured = result
+        self.assertEqual(len(content), 1)
+        text = content[0].text
         self.assertIn("LONG_SESSION_TIME_LIMIT_REACHED", text)
         self.assertIn("was NOT executed", text)
         self.assertIn("register_wakeup", text)
         self.assertIn("fallback wake-up has been scheduled", text)
+        self.assertEqual(structured["status"], "blocked_timeout")
+        self.assertFalse(structured["executed"])
+        self.assertEqual(structured["tool_name"], "read_workspace_file")
+        self.assertTrue(structured["long_session"]["timed_out"])
         self.assertEqual(len(FakeTimer.created), 1)
         fallback = FakeTimer.created[0]
         self.assertEqual(
@@ -192,9 +197,14 @@ class LongSessionTests(unittest.TestCase):
                 )
             )
 
-        self.assertIsInstance(result, list)
-        self.assertIn("LONG_SESSION_TIME_LIMIT_REACHED", result[0].text)
-        self.assertIn("was NOT executed", result[0].text)
+        self.assertIsInstance(result, tuple)
+        content, structured = result
+        self.assertIn("LONG_SESSION_TIME_LIMIT_REACHED", content[0].text)
+        self.assertIn("was NOT executed", content[0].text)
+        self.assertEqual(structured["status"], "blocked_timeout")
+        self.assertFalse(structured["executed"])
+        self.assertEqual(structured["tool_name"], "start_timer")
+        self.assertTrue(structured["long_session"]["timed_out"])
         self.assertEqual(server._long_session_started[url], expired_started)
         self.assertEqual(len(FakeTimer.created), 1)
         self.assertEqual(
@@ -202,29 +212,41 @@ class LongSessionTests(unittest.TestCase):
             "timeout_fallback",
         )
 
-    def test_start_timer_is_allowed_after_timeout_fallback_wakeup_was_sent(self) -> None:
-        url = "https://chatgpt.com/c/restart-after-fallback"
-        with server._long_session_lock:
-            server._long_session_started[url] = (
-                time.monotonic() - server.CONFIG.long_session_yield_after_seconds - 1
-            )
-            server._long_session_wakeup_results[url] = {
-                "status": "sent",
-                "kind": "timeout_fallback",
-                "finished_at_epoch_seconds": time.time(),
-            }
+    def test_start_timer_is_allowed_as_active_wakeup_confirmation(self) -> None:
+        for wakeup_status in ("sending", "awaiting_confirmation"):
+            with self.subTest(wakeup_status=wakeup_status):
+                self._reset_long_session_state()
+                url = f"https://chatgpt.com/c/restart-after-{wakeup_status}"
+                pending = FakeTimer(60, lambda: None)
+                with server._long_session_lock:
+                    server._long_session_started[url] = (
+                        time.monotonic()
+                        - server.CONFIG.long_session_yield_after_seconds
+                        - 1
+                    )
+                    server._long_session_wakeups[url] = pending
+                    server._long_session_wakeup_results[url] = {
+                        "status": wakeup_status,
+                        "kind": "timeout_fallback",
+                        "retry_number": 0,
+                    }
 
-        result = asyncio.run(
-            server.mcp.call_tool(
-                "start_timer",
-                {"conversation_url": url},
-            )
-        )
+                result = asyncio.run(
+                    server.mcp.call_tool(
+                        "start_timer",
+                        {"conversation_url": url},
+                    )
+                )
 
-        content, structured = result
-        self.assertEqual(structured["status"], "started")
-        self.assertTrue(structured["tracked"])
-        self.assertFalse(structured["timed_out"])
+                content, structured = result
+                self.assertEqual(structured["status"], "started")
+                self.assertTrue(structured["tracked"])
+                self.assertFalse(structured["timed_out"])
+                self.assertTrue(pending.cancelled)
+                self.assertEqual(
+                    server._long_session_wakeup_results[url]["status"],
+                    "confirmed",
+                )
 
     def test_timeout_gate_does_not_schedule_duplicate_fallbacks(self) -> None:
         url = "https://chatgpt.com/c/single-fallback"
