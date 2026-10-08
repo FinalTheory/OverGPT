@@ -125,6 +125,38 @@ def main() -> None:
         with tempfile.TemporaryDirectory(prefix="mymcp-browser-txn-") as temp_dir:
             profile = Path(temp_dir, "profile")
             original_fill = chatgpt_playwright._fill_verified_prompt
+
+            interstitial_fill_calls = 0
+
+            def fail_interstitial_once(*args: object, **kwargs: object) -> None:
+                nonlocal interstitial_fill_calls
+                interstitial_fill_calls += 1
+                if interstitial_fill_calls == 1:
+                    raise chatgpt_playwright.ChatGPTProfileInterstitialError(
+                        "synthetic blocking interstitial"
+                    )
+                original_fill(*args, **kwargs)
+
+            with patch.object(
+                chatgpt_playwright,
+                "_fill_verified_prompt",
+                side_effect=fail_interstitial_once,
+            ):
+                recovered = send_prompt(
+                    "browser marker",
+                    url=f"http://127.0.0.1:{retry_server.server_port}/?temporary-chat=true",
+                    profile_dir=profile,
+                    browser_channel="" if sys.platform == "linux" else "chrome",
+                    headless=True,
+                    timeout_seconds=10,
+                    verification_markers=("browser marker",),
+                )
+            if recovered["status"] != "sent" or interstitial_fill_calls != 2:
+                raise RuntimeError(
+                    "blocking pre-send interstitial did not trigger exactly one profile "
+                    f"reseed retry: result={recovered}, calls={interstitial_fill_calls}"
+                )
+
             fill_calls = 0
 
             def fail_first_fill(*args: object, **kwargs: object) -> None:

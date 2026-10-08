@@ -46,6 +46,10 @@ class ChatGPTPreSendError(RuntimeError):
     """Known-unsent browser failure that may be retried safely."""
 
 
+class ChatGPTProfileInterstitialError(ChatGPTPreSendError):
+    """A blocking pre-send interstitial invalidated one persistent slot profile."""
+
+
 class ChatGPTRateLimitError(RuntimeError):
     """Platform rate-limit UI blocked a known-unsent prompt."""
 
@@ -516,6 +520,19 @@ def _fill_verified_prompt(
     )
 
 
+def _pre_send_interstitial_detected(page: Any, response: Any | None = None) -> bool:
+    """Detect a blocking pre-send interstitial that invalidates this slot profile."""
+    try:
+        if response is not None and int(response.status) == 403:
+            return True
+    except Exception:
+        pass
+    try:
+        title = " ".join(page.title().split()).casefold()
+    except Exception:
+        title = ""
+    return title == "just a moment..." or title.startswith("just a moment")
+
 
 def _is_temporary_chat_url(url: str) -> bool:
     query = urlparse(url).query
@@ -625,7 +642,7 @@ def send_prompt(
         pass
 
     timeout_ms = timeout_seconds * 1000
-    attempts = 1
+    attempts = 2
     last_error: BaseException | None = None
 
     for attempt in range(1, attempts + 1):
@@ -647,10 +664,23 @@ def send_prompt(
                     context = playwright.chromium.launch_persistent_context(**options)
                     try:
                         page = context.pages[0] if context.pages else context.new_page()
-                        page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-                        _fill_verified_prompt(
-                            page, prompt, verification_markers, timeout_ms
+                        response = page.goto(
+                            url, wait_until="domcontentloaded", timeout=timeout_ms
                         )
+                        if _pre_send_interstitial_detected(page, response):
+                            raise ChatGPTProfileInterstitialError(
+                                "blocking pre-send interstitial detected before composer hydration"
+                            )
+                        try:
+                            _fill_verified_prompt(
+                                page, prompt, verification_markers, timeout_ms
+                            )
+                        except ChatGPTPreSendError as error:
+                            if _pre_send_interstitial_detected(page):
+                                raise ChatGPTProfileInterstitialError(
+                                    "blocking pre-send interstitial detected while waiting for composer"
+                                ) from error
+                            raise
                         if require_temporary_chat and not _is_temporary_chat_url(page.url):
                             raise ChatGPTPreSendError(
                                 "ChatGPT left Temporary Chat before sending"
@@ -716,8 +746,16 @@ def send_prompt(
             if reservation_task_id is not None and reservation_slot is not None:
                 release_browser_slot(reservation_task_id, reservation_slot)
             raise
+        except ChatGPTProfileInterstitialError as error:
+            last_error = error
+            try:
+                if attempt_profile.exists():
+                    shutil.rmtree(attempt_profile)
+            except OSError:
+                pass
         except ChatGPTPreSendError as error:
             last_error = error
+            break
         except PlaywrightError as error:
             if click_may_have_committed:
                 if reservation_task_id is not None and reservation_slot is not None:
@@ -751,7 +789,7 @@ def send_prompt(
     if reservation_task_id is not None and reservation_slot is not None:
         release_browser_slot(reservation_task_id, reservation_slot)
     raise ChatGPTPreSendError(
-        f"ChatGPT pre-send automation failed after {attempts} attempts: {last_error}"
+        f"ChatGPT pre-send automation failed after {attempt} attempts: {last_error}"
     ) from last_error
 
 
