@@ -44,6 +44,7 @@ RUN apt-get update \
         xvfb \
     && ln -s /usr/bin/fdfind /usr/local/bin/fd \
     && npm install --global \
+        @openai/codex \
         pyright \
         typescript \
         typescript-language-server \

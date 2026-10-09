@@ -67,20 +67,20 @@ Use `run_workspace_code(background=true)` for long-running Shell or Python comma
 
 After modifying Python source inside a running deployment, `restart_mcp_server` can validate the updated import and restart the container without rebuilding the image. Dependency, Dockerfile, or Compose changes still require the appropriate rebuild/redeploy path.
 
-## ChatGPT sub-agent development
+## Sub-agent development
 
 `spawn_chatgpt_subagents` is the public delegation primitive. Preserve every returned task ID and output path, including partial-success batches.
 
-A delegated ChatGPT task communicates through persistent workspace files:
+A delegated task communicates through persistent workspace files:
 
 - `input.md` is the authoritative task input.
 - `output.md` is the authoritative business result.
 - stdout/stderr are execution logs, not result channels.
 - completion is recognized through the fixed sentinel protocol.
 
-The persistent authenticated ChatGPT profile is a template. Individual tasks run in isolated task-profile slots so concurrent agents do not write to the same browser profile.
+The preferred backend is Codex CLI. Each task performs a read-only Codex availability preflight before executing the real task. Healthy Codex tasks do not reserve browser slots and are not subject to browser concurrency limits. If the preflight fails before user-task execution begins, the worker may fall back to the ChatGPT Web backend, which retains the bounded browser-slot/profile semantics.
 
-When changing browser automation, preserve the separation between task acceptance, browser-slot capacity, output-file acknowledgement, final completion, and background-task supervision. Those states exist to avoid losing already-started work when later launches fail.
+Never fall back to the browser after the real Codex task has started: Codex may already have changed workspace state, so a second execution would create duplicate side effects.
 
 ## Long-session development
 

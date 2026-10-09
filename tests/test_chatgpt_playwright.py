@@ -663,7 +663,9 @@ def main() -> None:
         if "spawn_chatgpt_subagents" not in registered_tool_names:
             raise RuntimeError("batch sub-agent MCP tool is not registered")
 
-        delegated_task = "THIS_CONTENT_MUST_NOT_BE_IN_THE_BROWSER_PROMPT"
+        import subagent_backend
+
+        delegated_task = "THIS_CONTENT_MUST_NOT_BE_IN_THE_RUNNER_CODE"
         demo_task_id = "task_" + "d" * 32
         demo_task_dir = Path(
             workspace, "mymcp", "task_state", demo_task_id.removeprefix("task_")
@@ -684,50 +686,38 @@ def main() -> None:
                     "stderr_path": f"mymcp/task_state/{demo_task_id.removeprefix('task_')}/stderr.log",
                 },
             ) as mocked_start,
-            patch.object(
-                chatgpt_playwright,
-                "reserve_browser_slot",
-                return_value=2,
-            ),
         ):
             single_batch = server.spawn_chatgpt_subagents([delegated_task])
             delegated = single_batch["items"][0]
         task_code = mocked_start.call_args.args[1]
         if delegated_task in task_code:
-            raise RuntimeError("input contents leaked into the browser prompt")
-        if "runpy" in task_code or "send_subagent_task" not in task_code:
-            raise RuntimeError(
-                "background task does not directly import the sub-agent runner"
-            )
+            raise RuntimeError("input contents leaked into the sub-agent runner code")
+        if "run_subagent_task" not in task_code or "send_subagent_task" in task_code:
+            raise RuntimeError("background task did not use the backend selector")
         if (
             delegated["input_path"] not in task_code
             or delegated["output_path"] not in task_code
-            or "reservation_slot=2" not in task_code
+            or "reservation_slot" in task_code
         ):
-            raise RuntimeError(
-                "normalized paths were not passed to the background task"
-            )
+            raise RuntimeError("delegated paths/backend isolation were not preserved")
         input_file = Path(workspace, delegated["input_path"])
         if input_file.read_text(encoding="utf-8") != delegated_task:
             raise RuntimeError("delegated task was not persisted to the allocated input")
-        if Path(delegated["input_path"]).parent != Path(
-            delegated["output_path"]
-        ).parent:
+        if Path(delegated["input_path"]).parent != Path(delegated["output_path"]).parent:
             raise RuntimeError(f"allocated paths do not share one directory: {delegated}")
         if Path(workspace, delegated["output_path"]).exists():
-            raise RuntimeError("sub-agent output was pre-created instead of child-created")
-        if not delegated["input_path"].startswith(
-            f"mymcp/task_state/{demo_task_id.removeprefix('task_')}/"
-        ):
-            raise RuntimeError(f"sub-agent artifacts are not task-owned: {delegated}")
+            raise RuntimeError("sub-agent output was pre-created")
+        if delegated.get("browser_slot") is not None:
+            raise RuntimeError("Codex-first spawn path reserved a browser slot eagerly")
+        if delegated.get("backend_policy") != "codex_then_browser":
+            raise RuntimeError(f"unexpected backend policy: {delegated}")
         if (
             delegated["status"] != "started"
             or delegated["task_status"] != "queued"
             or delegated["task_id"] != demo_task_id
         ):
             raise RuntimeError(f"sub-agent was not queued asynchronously: {delegated}")
-        if delegated["browser_slot"] != 2:
-            raise RuntimeError(f"sub-agent did not return its reserved slot: {delegated}")
+
         try:
             server.spawn_chatgpt_subagents(["   "])
         except ValueError:
@@ -735,142 +725,28 @@ def main() -> None:
         else:
             raise RuntimeError("empty delegated task was accepted")
 
-        full_task_id = "task_" + "e" * 32
-        full_task_dir = Path(
-            workspace, "mymcp", "task_state", full_task_id.removeprefix("task_")
-        ).resolve()
-        full_task_dir.mkdir()
-        with (
-            patch.object(
-                server,
-                "_reserve_workspace_task_dir",
-                return_value=(full_task_id, full_task_dir),
-            ),
-            patch.object(
-                chatgpt_playwright,
-                "reserve_browser_slot",
-                side_effect=chatgpt_playwright.ChatGPTCapacityError(
-                    "ChatGPT browser capacity is full (3 concurrent tasks)"
-                ),
-            ),
-        ):
-            full_batch = server.spawn_chatgpt_subagents(["capacity probe"])
-        if full_batch["status"] != "none_started":
-            raise RuntimeError(f"full capacity batch should start nothing: {full_batch}")
-        if full_batch["items"][0]["status"] != "rejected_capacity":
-            raise RuntimeError(f"full capacity batch did not report rejection: {full_batch}")
-        if full_task_dir.exists():
-            raise RuntimeError("rejected sub-agent left an unstarted task directory")
-
-        failed_start_task_id = "task_" + "f" * 32
-        failed_start_task_dir = Path(
-            workspace,
-            "mymcp",
-            "task_state",
-            failed_start_task_id.removeprefix("task_"),
-        ).resolve()
-        failed_start_task_dir.mkdir()
-        with (
-            patch.object(
-                server,
-                "_reserve_workspace_task_dir",
-                return_value=(failed_start_task_id, failed_start_task_dir),
-            ),
-            patch.object(
-                chatgpt_playwright,
-                "reserve_browser_slot",
-                return_value=2,
-            ),
-            patch.object(
-                chatgpt_playwright,
-                "release_browser_slot",
-            ) as mocked_release,
-            patch.object(
-                server,
-                "_start_workspace_task",
-                side_effect=RuntimeError("simulated background start failure"),
-            ),
-        ):
-            try:
-                server.spawn_chatgpt_subagents(["background start failure probe"])
-            except RuntimeError:
-                pass
-            else:
-                raise RuntimeError("background start failure was silently accepted")
-        mocked_release.assert_called_once_with(failed_start_task_id, 2)
-        if failed_start_task_dir.exists():
-            raise RuntimeError("failed background start left an unowned task directory")
-
-        started_a = {
-            "task_id": "task_" + "a" * 32,
-            "status": "queued",
-            "output_path": f"mymcp/task_state/{'a' * 32}/output.md",
-        }
-        started_b = {
-            "task_id": "task_" + "b" * 32,
-            "status": "queued",
-            "output_path": f"mymcp/task_state/{'b' * 32}/output.md",
-        }
+        # Codex-first batches are intentionally not subject to the old browser batch/global limits.
+        started_items = [
+            {
+                "task_id": "task_" + ch * 32,
+                "status": "queued",
+                "output_path": f"mymcp/task_state/{ch * 32}/output.md",
+                "backend_policy": "codex_then_browser",
+            }
+            for ch in ("a", "b", "c", "e")
+        ]
         with patch.object(
-            server, "_spawn_one_chatgpt_subagent"
-        ) as mocked_oversized_batch:
-            try:
-                server.spawn_chatgpt_subagents(
-                    ["task a", "task b", "task c", "task d"]
-                )
-            except ValueError as error:
-                if "maximum batch size is 3" not in str(error):
-                    raise
-            else:
-                raise RuntimeError("oversized sub-agent batch was accepted")
-        if mocked_oversized_batch.called:
-            raise RuntimeError("oversized batch produced side effects before rejection")
-
-        with (
-            patch.object(server, "_count_active_chatgpt_subagents", return_value=4),
-            patch.object(server, "_spawn_one_chatgpt_subagent") as mocked_over_capacity,
-        ):
-            try:
-                server.spawn_chatgpt_subagents(["task a", "task b"])
-            except chatgpt_playwright.ChatGPTCapacityError as error:
-                if "global limit of 5" not in str(error):
-                    raise
-            else:
-                raise RuntimeError("global active sub-agent limit was not enforced")
-        if mocked_over_capacity.called:
-            raise RuntimeError("over-capacity batch started tasks before rejection")
-
-        with (
-            patch.object(server, "_count_active_chatgpt_subagents", return_value=0),
-            patch.object(
-                server,
-                "_spawn_one_chatgpt_subagent",
-                side_effect=[
-                    started_a,
-                    started_b,
-                    chatgpt_playwright.ChatGPTCapacityError(
-                        "ChatGPT browser capacity is full (3 concurrent tasks)"
-                    ),
-                ],
-            ) as mocked_batch_spawn,
-        ):
-            batch = server.spawn_chatgpt_subagents(["task a", "task b", "task c"])
-        if batch["status"] != "partial" or batch["started"] != 2:
-            raise RuntimeError(f"partial batch launch lost success state: {batch}")
-        statuses = [item["status"] for item in batch["items"]]
-        if statuses != ["started", "started", "rejected_capacity"]:
-            raise RuntimeError(f"unexpected partial batch statuses: {batch}")
-        if [
-            batch["items"][0]["task_id"],
-            batch["items"][1]["task_id"],
-        ] != [started_a["task_id"], started_b["task_id"]]:
-            raise RuntimeError(f"partial batch lost started task IDs: {batch}")
-        if mocked_batch_spawn.call_count != 3:
-            raise RuntimeError(
-                "batch launch continued spawning after deterministic capacity rejection"
+            server, "_spawn_one_subagent", side_effect=started_items
+        ) as mocked_unbounded_batch:
+            batch = server.spawn_chatgpt_subagents(
+                ["task a", "task b", "task c", "task d"]
             )
+        if batch["status"] != "all_started" or batch["started"] != 4:
+            raise RuntimeError(f"Codex batch was incorrectly browser-limited: {batch}")
+        if mocked_unbounded_batch.call_count != 4:
+            raise RuntimeError("Codex batch did not launch every requested task")
 
-        with patch.object(server, "_spawn_one_chatgpt_subagent") as mocked_invalid_batch:
+        with patch.object(server, "_spawn_one_subagent") as mocked_invalid_batch:
             try:
                 server.spawn_chatgpt_subagents(["valid first task", "   "])
             except ValueError:
@@ -882,8 +758,8 @@ def main() -> None:
 
         with patch.object(
             server,
-            "_spawn_one_chatgpt_subagent",
-            side_effect=[started_a, RuntimeError("simulated launch failure")],
+            "_spawn_one_subagent",
+            side_effect=[started_items[0], RuntimeError("simulated launch failure")],
         ):
             failed_batch = server.spawn_chatgpt_subagents(
                 ["task a", "task b", "task c"]
@@ -896,6 +772,75 @@ def main() -> None:
             raise RuntimeError(
                 f"partial runtime failure hid started task state: {failed_batch}"
             )
+
+        # Backend selection: successful Codex preflight/execution must never touch browser capacity.
+        backend_id = "1" * 32
+        backend_dir = Path(workspace, "mymcp", "task_state", backend_id)
+        backend_dir.mkdir(exist_ok=True)
+        backend_input = f"mymcp/task_state/{backend_id}/input.md"
+        backend_output = f"mymcp/task_state/{backend_id}/output.md"
+        backend_dir.joinpath("input.md").write_text("backend probe", encoding="utf-8")
+        backend_config = replace(
+            test_config, codex_subagent_enabled=True, chatgpt_automation_enabled=True
+        )
+        with (
+            patch.object(subagent_backend, "CONFIG", backend_config),
+            patch.object(subagent_backend, "_resolve_codex_binary", return_value="/fake/codex"),
+            patch.object(subagent_backend, "_codex_preflight"),
+            patch.object(
+                subagent_backend,
+                "_run_codex_subagent",
+                return_value={"status": "completed", "backend": "codex"},
+            ),
+            patch.object(subagent_backend, "reserve_browser_slot") as reserve_browser,
+        ):
+            selected = subagent_backend.run_subagent_task(backend_input, backend_output)
+        if selected["backend"] != "codex" or reserve_browser.called:
+            raise RuntimeError("healthy Codex backend touched browser capacity")
+
+        # Preflight failure occurs before user-task execution, so browser fallback is safe.
+        with (
+            patch.object(subagent_backend, "CONFIG", backend_config),
+            patch.object(subagent_backend, "_resolve_codex_binary", return_value="/fake/codex"),
+            patch.object(
+                subagent_backend,
+                "_codex_preflight",
+                side_effect=subagent_backend.CodexPreflightError("quota unavailable"),
+            ),
+            patch.object(subagent_backend, "reserve_browser_slot", return_value=1) as reserve_browser,
+            patch.object(
+                subagent_backend,
+                "send_subagent_task",
+                return_value={"status": "completed"},
+            ) as browser_send,
+        ):
+            selected = subagent_backend.run_subagent_task(backend_input, backend_output)
+        if selected["backend"] != "chatgpt_browser_fallback":
+            raise RuntimeError("Codex preflight failure did not select browser fallback")
+        reserve_browser.assert_called_once()
+        browser_send.assert_called_once()
+
+        # Once the real Codex task begins, later failure must not duplicate side effects via browser.
+        with (
+            patch.object(subagent_backend, "CONFIG", backend_config),
+            patch.object(subagent_backend, "_resolve_codex_binary", return_value="/fake/codex"),
+            patch.object(subagent_backend, "_codex_preflight"),
+            patch.object(
+                subagent_backend,
+                "_run_codex_subagent",
+                side_effect=RuntimeError("actual Codex task failed"),
+            ),
+            patch.object(subagent_backend, "reserve_browser_slot") as reserve_browser,
+        ):
+            try:
+                subagent_backend.run_subagent_task(backend_input, backend_output)
+            except RuntimeError as error:
+                if "actual Codex task failed" not in str(error):
+                    raise
+            else:
+                raise RuntimeError("actual Codex task failure was hidden")
+        if reserve_browser.called:
+            raise RuntimeError("ambiguous post-execution Codex failure retried in browser")
 
         with (
             patch.object(

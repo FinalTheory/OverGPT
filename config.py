@@ -98,9 +98,17 @@ class Config:
     chatgpt_prompt_file: Path = SOURCE_ROOT / "prompts" / "chatgpt_subagent.md"
     chatgpt_browser_timeout_seconds: int = 30
     chatgpt_browser_hard_timeout_seconds: int = 240
-    chatgpt_subagent_max_batch_size: int = 3
-    chatgpt_subagent_max_active: int = 5
     chatgpt_completion_timeout_seconds: int = 3_600
+
+    codex_subagent_enabled: bool = _env_bool("MCP_CODEX_SUBAGENT_ENABLED", True)
+    codex_home: Path = Path(
+        os.getenv("CODEX_HOME", "/opt/workspace/.codex")
+    ).resolve()
+    codex_binary: str = os.getenv("MCP_CODEX_BINARY", "codex").strip()
+    codex_model: str = os.getenv("MCP_CODEX_MODEL", "gpt-6-astra").strip()
+    codex_reasoning_effort: str = os.getenv(
+        "MCP_CODEX_REASONING_EFFORT", "medium"
+    ).strip()
 
     @property
     def skills_root(self) -> Path:

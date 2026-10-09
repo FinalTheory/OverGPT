@@ -99,9 +99,9 @@ OverGPT 随后会向同一个对话发送继续执行的消息。
 
 ## 孵化新的递归 sub-agent
 
-OverGPT 可以启动新的 ChatGPT 对话作为独立 worker。
+OverGPT 可以启动相互隔离的 delegated worker。
 
-每个委派任务都有明确的输入、持久化输出、任务状态和独立浏览器执行槽。父代理会立即拿到 task ID，因此可以在子任务独立运行时继续自己的工作。
+每个委派任务都有明确的输入、持久化输出和 durable task state。首选 backend 是 Codex CLI：真正执行任务之前先通过只读 preflight 检查认证、模型和服务是否可用；如果 preflight 不可用，则退回到受浏览器执行槽限制的 ChatGPT Web backend。父代理会立即拿到 task ID，因此可以在子任务独立运行时继续自己的工作。
 
 ```text
                     父 ChatGPT
@@ -137,7 +137,7 @@ WebCodex 可以继续负责代码库执行和耗时较长的开发任务。OverG
 
 当前实现面向能够访问 MCP 的 ChatGPT。
 
-会话续接和 sub-agent 孵化通过 Playwright 驱动已经登录的 ChatGPT Web 会话完成。持久 workspace 文件负责任务交接和结果回收，MCP server 提供计时、任务监督以及继续执行和委派所需要的控制能力。
+会话续接仍然通过 Playwright 驱动已经登录的 ChatGPT Web 会话完成。sub-agent 孵化改为 Codex-first：Codex CLI 直接在共享 workspace 中运行；只有 Codex availability preflight 失败时，才把 ChatGPT Web 作为 best-effort fallback。持久 workspace 文件负责任务交接和结果回收，MCP server 提供计时、任务监督以及继续执行和委派所需要的控制能力。
 
 OverGPT 自己也带有基础 workspace 工具，但它的目标是与 WebCodex 配合使用。对于软件工程场景，WebCodex 提供更完整的代码库和开发工具层，OverGPT 则负责让 ChatGPT 能够跨 turn 持续工作，并把独立任务拆到新的对话里执行。
 

@@ -99,9 +99,9 @@ A long logical task can therefore span multiple ChatGPT turns without pretending
 
 ## Spawn fresh recursive sub-agents
 
-OverGPT can launch fresh ChatGPT conversations as isolated workers.
+OverGPT can launch isolated delegated workers with fresh execution context.
 
-Each delegated task gets explicit input, persistent output, task state, and its own browser execution slot. The parent receives a task ID immediately and can keep working while the child runs independently.
+Each delegated task gets explicit input, persistent output, and durable task state. The preferred backend is Codex CLI; a read-only preflight checks authentication/model/service availability before the real task starts. If that preflight is unavailable, the task can fall back to the bounded ChatGPT Web browser backend. The parent receives a task ID immediately and can keep working while the child runs independently.
 
 ```text
                     parent ChatGPT
@@ -138,7 +138,7 @@ WebCodex can continue to own repository execution and long-running developer job
 
 The current implementation targets ChatGPT with MCP access.
 
-Conversation continuation and sub-agent spawning use authenticated ChatGPT Web sessions driven through Playwright. Persistent workspace files provide task handoff and result collection. The MCP server provides timing, task supervision, and the control primitives needed to continue or delegate work.
+Conversation continuation still uses an authenticated ChatGPT Web session driven through Playwright. Sub-agent spawning is Codex-first: Codex CLI runs locally against the shared workspace, while ChatGPT Web remains a best-effort fallback when Codex availability preflight fails. Persistent workspace files provide task handoff and result collection. The MCP server provides timing, task supervision, and the control primitives needed to continue or delegate work.
 
 OverGPT can run with its own workspace tools, but it is designed to complement WebCodex. For software-engineering use, WebCodex provides the richer repository and developer-tool layer while OverGPT focuses on keeping ChatGPT working across turns and splitting independent work into fresh conversations.
 

@@ -428,13 +428,11 @@ mcp = LongSessionFastMCP(
         "delete_workspace_file and move_workspace_file for ordinary file mutations instead of "
         "shell rm/mv. Use run_workspace_code(background=true) for "
         "long-running commands, then poll get_workspace_task with the returned task_id; background "
-        "commands default to a one-hour timeout. Delegate ChatGPT sub-agents only through "
-        "spawn_chatgpt_subagents, passing a one-element list for a single task or up to "
-        f"{CONFIG.chatgpt_subagent_max_batch_size} independent tasks in one batch. The server "
-        f"also enforces at most {CONFIG.chatgpt_subagent_max_active} active ChatGPT sub-agents "
-        "globally; if either limit would be exceeded, reduce the batch or wait for existing "
-        "sub-agents to finish. Partial browser-capacity/start failures still return every "
-        "task ID that was already created. Preserve each separately returned "
+        "commands default to a one-hour timeout. Delegate independent sub-agents through "
+        "spawn_chatgpt_subagents. The preferred backend is Codex CLI; Codex tasks do not consume "
+        "browser slots or participate in the browser concurrency limit. Each task performs a "
+        "read-only Codex availability preflight before executing the real task. If that preflight "
+        "fails, the task may fall back to the bounded ChatGPT Web backend. Preserve each returned "
         "output_path as the sub-agent's result file; stdout_path and stderr_path are execution "
         "logs. Call get_workspace_task with its defaults: it waits server-side for up to 30 "
         "seconds, returning sooner when the task finishes. If a task fails or times out, read "
@@ -467,7 +465,6 @@ mcp = LongSessionFastMCP(
 )
 
 _workspace_write_lock = threading.RLock()
-_chatgpt_subagent_admission_lock = threading.RLock()
 
 _DEFAULT_WAKEUP_PROMPT = "Continue the previous task from where you stopped."
 
@@ -994,19 +991,13 @@ def _render_chatgpt_subagent_prompt(input_path: str, output_path: str) -> str:
     )
 
 
-def _chatgpt_subagent_task_code(
-    input_path: str, output_path: str, reservation_slot: int
-) -> str:
+def _subagent_task_code(input_path: str, output_path: str) -> str:
     return "\n".join(
         [
             "import sys",
             f"sys.path.insert(0, {str(CONFIG.project_root)!r})",
-            "from chatgpt_playwright import send_subagent_task",
-            (
-                "result = send_subagent_task("
-                f"{input_path!r}, {output_path!r}, wait_for_completion=True, "
-                f"reservation_slot={reservation_slot!r})"
-            ),
+            "from subagent_backend import run_subagent_task",
+            f"result = run_subagent_task({input_path!r}, {output_path!r})",
             "print(result)",
         ]
     )
@@ -2063,12 +2054,7 @@ def apply_workspace_patch(patch: str) -> dict[str, Any]:
     return {"applied": True, "patch_chars": len(patch)}
 
 
-def _validate_chatgpt_subagent_task(task: str) -> None:
-    if not CONFIG.chatgpt_automation_enabled:
-        raise RuntimeError(
-            "ChatGPT browser automation is disabled; set "
-            "MCP_CHATGPT_AUTOMATION_ENABLED=true for the local MCP process"
-        )
+def _validate_subagent_task(task: str) -> None:
     if not isinstance(task, str):
         raise TypeError("task must be a string")
     if not task.strip():
@@ -2077,201 +2063,109 @@ def _validate_chatgpt_subagent_task(task: str) -> None:
         raise ValueError(f"task exceeds the {CONFIG.max_read_chars} character limit")
 
 
-def _spawn_one_chatgpt_subagent(task: str) -> dict[str, Any]:
-    """Start one already-validated delegated browser task."""
+def _spawn_one_subagent(task: str) -> dict[str, Any]:
+    """Start one already-validated delegated task with Codex-first backend selection."""
     task_id, task_dir = _reserve_workspace_task_dir()
     relative_task_dir = task_dir.relative_to(CONFIG.workspace_root).as_posix()
     normalized_input = f"{relative_task_dir}/input.md"
     normalized_output = f"{relative_task_dir}/output.md"
-    reservation_slot: int | None = None
     try:
         _write_text_atomic(task_dir / "input.md", task)
-        _render_chatgpt_subagent_prompt(normalized_input, normalized_output)
-        from chatgpt_playwright import reserve_browser_slot
-
-        reservation_slot = reserve_browser_slot(task_id, task_dir)
-    except BaseException:
-        shutil.rmtree(task_dir, ignore_errors=True)
-        raise
-
-    # The delegated runner owns the authoritative one-hour post-send completion
-    # timeout. Give the outer background supervisor the full configured maximum so
-    # browser-profile queueing/setup cannot consume that completion budget.
-    assert reservation_slot is not None
-    try:
         result = _start_workspace_task(
             "python",
-            _chatgpt_subagent_task_code(
-                normalized_input, normalized_output, reservation_slot
-            ),
+            _subagent_task_code(normalized_input, normalized_output),
             CONFIG.workspace_root,
             ".",
             CONFIG.max_background_timeout_seconds,
             task_id=task_id,
             task_dir=task_dir,
             metadata={
-                "kind": "chatgpt_subagent",
+                "kind": "subagent",
                 "input_path": normalized_input,
                 "output_path": normalized_output,
-                "browser_slot": reservation_slot,
+                "backend_policy": "codex_then_browser",
             },
         )
     except BaseException:
-        from chatgpt_playwright import release_browser_slot
-
-        release_browser_slot(task_id, reservation_slot)
         shutil.rmtree(task_dir, ignore_errors=True)
         raise
     return {
         **result,
         "input_path": normalized_input,
         "output_path": normalized_output,
-        "browser_slot": reservation_slot,
-        "completion": "task-owned output file creation plus final completion sentinel",
+        "backend_policy": "codex_then_browser",
+        "completion": "task-owned final output file plus completion sentinel",
         "message": "Sub-agent queued; poll get_workspace_task with task_id.",
     }
 
 
-def _count_active_chatgpt_subagents() -> int:
-    """Reconcile persisted task state and count live delegated ChatGPT tasks."""
-    if not CONFIG.tasks_root.is_dir():
-        return 0
-
-    active = 0
-    for task_dir in CONFIG.tasks_root.iterdir():
-        if (
-            not re.fullmatch(r"[0-9a-f]{32}", task_dir.name)
-            or task_dir.is_symlink()
-            or not task_dir.is_dir()
-        ):
-            continue
-        status_path = task_dir / "status.json"
-        if not status_path.is_file():
-            continue
-
-        status = _read_task_json(status_path)
-        if status.get("kind") != "chatgpt_subagent":
-            continue
-        if status.get("status") in {"queued", "running"}:
-            status = _recover_workspace_task(task_dir, f"task_{task_dir.name}")
-        if status.get("status") in {"queued", "running"}:
-            active += 1
-    return active
-
-
 @mcp.tool()
 def spawn_chatgpt_subagents(tasks: list[str]) -> dict[str, Any]:
-    """Safely start a bounded batch of independent ChatGPT Web sub-agents.
+    """Start independent delegated tasks using Codex first and ChatGPT Web as fallback.
 
-    The complete batch is rejected before side effects when either the per-call
-    batch limit or the global active-sub-agent limit would be exceeded.
+    Codex tasks do not consume browser slots and are not subject to browser concurrency
+    limits. If Codex availability preflight fails, that task may fall back to the bounded
+    ChatGPT Web backend.
     """
     if not isinstance(tasks, list) or not tasks:
         raise ValueError("tasks must be a non-empty list of task strings")
-    if len(tasks) > CONFIG.chatgpt_subagent_max_batch_size:
-        raise ValueError(
-            f"batch contains {len(tasks)} tasks but the maximum batch size is "
-            f"{CONFIG.chatgpt_subagent_max_batch_size}; reduce the batch and retry"
-        )
 
-    # Validate the whole request before starting any task. A malformed later item
-    # must never leave earlier browser tasks running.
+    # Validate the complete request before any side effect.
     for task in tasks:
-        _validate_chatgpt_subagent_task(task)
+        _validate_subagent_task(task)
 
-    from chatgpt_playwright import ChatGPTCapacityError
-
-    # Serialize admission so two concurrent spawn calls cannot both observe the
-    # same free global capacity and oversubscribe the active-sub-agent limit.
-    with _chatgpt_subagent_admission_lock:
-        active_before = _count_active_chatgpt_subagents()
-        requested = len(tasks)
-        if active_before + requested > CONFIG.chatgpt_subagent_max_active:
-            available = max(0, CONFIG.chatgpt_subagent_max_active - active_before)
-            raise ChatGPTCapacityError(
-                f"{active_before} ChatGPT sub-agents are currently active; accepting "
-                f"{requested} more would exceed the global limit of "
-                f"{CONFIG.chatgpt_subagent_max_active}. At most {available} additional "
-                "sub-agent(s) can be started now; reduce the batch or wait for existing "
-                "sub-agents to finish."
-            )
-
-        items: list[dict[str, Any]] = []
-        started = 0
-        stop_reason: str | None = None
-
-        for index, task in enumerate(tasks):
-            if stop_reason is not None:
-                items.append(
-                    {
-                        "index": index,
-                        "status": stop_reason,
-                        "task_id": None,
-                    }
-                )
-                continue
-
-            try:
-                result = _spawn_one_chatgpt_subagent(task)
-            except ChatGPTCapacityError as exc:
-                items.append(
-                    {
-                        "index": index,
-                        "status": "rejected_capacity",
-                        "task_id": None,
-                        "error_type": type(exc).__name__,
-                        "error": str(exc),
-                    }
-                )
-                stop_reason = "not_started_capacity"
-                continue
-            except Exception as exc:
-                # Before any task starts, retain the existing loud failure behavior.
-                # After partial success, never throw away the only handles to already
-                # running tasks; return the start failure alongside those handles.
-                if started == 0:
-                    raise
-                items.append(
-                    {
-                        "index": index,
-                        "status": "failed_to_start",
-                        "task_id": None,
-                        "error_type": type(exc).__name__,
-                        "error": str(exc),
-                    }
-                )
-                stop_reason = "not_started_after_error"
-                continue
-
-            started += 1
+    items: list[dict[str, Any]] = []
+    started = 0
+    stop_reason: str | None = None
+    for index, task in enumerate(tasks):
+        if stop_reason is not None:
+            items.append({"index": index, "status": stop_reason, "task_id": None})
+            continue
+        try:
+            result = _spawn_one_subagent(task)
+        except Exception as exc:
+            if started == 0:
+                raise
             items.append(
                 {
-                    **result,
                     "index": index,
-                    "task_status": result.get("status"),
-                    "status": "started",
+                    "status": "failed_to_start",
+                    "task_id": None,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
                 }
             )
+            stop_reason = "not_started_after_error"
+            continue
 
-        if started == len(tasks):
-            batch_status = "all_started"
-        elif started == 0:
-            batch_status = "none_started"
-        else:
-            batch_status = "partial"
+        started += 1
+        items.append(
+            {
+                **result,
+                "index": index,
+                "task_status": result.get("status"),
+                "status": "started",
+            }
+        )
 
-        return {
-            "status": batch_status,
-            "requested": len(tasks),
-            "started": started,
-            "active_before": active_before,
-            "active_limit": CONFIG.chatgpt_subagent_max_active,
-            "items": items,
-            "message": (
-                "Batch launch completed; preserve task_id/output_path from every "
-                "item whose status is started."
-            ),
-        }
+    if started == len(tasks):
+        batch_status = "all_started"
+    elif started == 0:
+        batch_status = "none_started"
+    else:
+        batch_status = "partial"
+
+    return {
+        "status": batch_status,
+        "requested": len(tasks),
+        "started": started,
+        "backend_policy": "codex_then_browser",
+        "items": items,
+        "message": (
+            "Batch launch completed; preserve task_id/output_path from every "
+            "item whose status is started."
+        ),
+    }
 
 
 @mcp.tool()
