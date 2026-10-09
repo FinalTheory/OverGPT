@@ -78,7 +78,7 @@ class Config:
     long_session_log_prune_interval_seconds: int = 60 * 60
     execution_home: str = os.getenv("MCP_EXECUTION_HOME", "")
     restart_delay_seconds: float = 2.0
-    long_session_yield_after_seconds: int = 25 * 60
+    long_session_yield_after_seconds: int = 20 * 60
     long_session_wakeup_delay_seconds: int = 60
     long_session_wakeup_confirmation_timeout_seconds: int = 60
     long_session_timeout_fallback_delay_seconds: int = 20 * 60
