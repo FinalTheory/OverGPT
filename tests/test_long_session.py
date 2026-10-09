@@ -72,9 +72,11 @@ class LongSessionTests(unittest.TestCase):
 
     def test_all_ordinary_tools_accept_optional_conversation_url(self) -> None:
         tools = asyncio.run(server.mcp.list_tools())
-        controls = {"start_timer", "end_timer", "register_wakeup"}
+        controls = {"register_wakeup"}
         tool_names = {tool.name for tool in tools}
         self.assertTrue(controls.issubset(tool_names))
+        self.assertNotIn("start_timer", tool_names)
+        self.assertNotIn("end_timer", tool_names)
         self.assertNotIn("list_long_sessions", tool_names)
         for tool in tools:
             if tool.name in controls:
@@ -95,9 +97,17 @@ class LongSessionTests(unittest.TestCase):
         url = "https://chatgpt.com/g/g-p-69ed598d4b80819193cbe418446ffaf4/c/6ab4c8ab-3dbc-83ea-9a4b-c5ae2fa35fbf"
         self.assertEqual(server._validate_conversation_url(url), url)
 
-    def test_server_authoritatively_computes_twenty_minute_timeout(self) -> None:
+    def test_first_ordinary_tool_implicitly_starts_timer(self) -> None:
         url = "https://chatgpt.com/c/lease-test"
-        started = server.start_timer(url)
+        result = asyncio.run(
+            server.mcp.call_tool(
+                "read_workspace_file",
+                {"path": "mymcp/README.md", "conversation_url": url},
+            )
+        )
+        content, structured = result
+        self.assertTrue(content[-1].text.startswith("LONG_SESSION_STATUS "))
+        started = structured["long_session"]
         self.assertTrue(started["tracked"])
         self.assertEqual(
             started["yield_after_seconds"],
@@ -115,7 +125,6 @@ class LongSessionTests(unittest.TestCase):
 
     def test_ordinary_tool_returns_lease_in_text_and_structured_output(self) -> None:
         url = "https://chatgpt.com/c/result-test"
-        server.start_timer(url)
         result = asyncio.run(
             server.mcp.call_tool(
                 "read_workspace_file",
@@ -130,7 +139,6 @@ class LongSessionTests(unittest.TestCase):
 
     def test_timed_out_session_blocks_ordinary_tool_before_execution(self) -> None:
         url = "https://chatgpt.com/c/blocked-after-timeout"
-        server.start_timer(url)
         with server._long_session_lock:
             server._long_session_started[url] = (
                 time.monotonic() - server.CONFIG.long_session_yield_after_seconds - 1
@@ -180,39 +188,7 @@ class LongSessionTests(unittest.TestCase):
             )
         )
 
-    def test_timed_out_session_cannot_reset_itself_with_start_timer(self) -> None:
-        url = "https://chatgpt.com/c/no-self-reset"
-        server.start_timer(url)
-        with server._long_session_lock:
-            expired_started = (
-                time.monotonic() - server.CONFIG.long_session_yield_after_seconds - 1
-            )
-            server._long_session_started[url] = expired_started
-
-        with patch.object(server.threading, "Timer", FakeTimer):
-            result = asyncio.run(
-                server.mcp.call_tool(
-                    "start_timer",
-                    {"conversation_url": url},
-                )
-            )
-
-        self.assertIsInstance(result, tuple)
-        content, structured = result
-        self.assertIn("LONG_SESSION_TIME_LIMIT_REACHED", content[0].text)
-        self.assertIn("was NOT executed", content[0].text)
-        self.assertEqual(structured["status"], "blocked_timeout")
-        self.assertFalse(structured["executed"])
-        self.assertEqual(structured["tool_name"], "start_timer")
-        self.assertTrue(structured["long_session"]["timed_out"])
-        self.assertEqual(server._long_session_started[url], expired_started)
-        self.assertEqual(len(FakeTimer.created), 1)
-        self.assertEqual(
-            server._long_session_wakeup_results[url]["kind"],
-            "timeout_fallback",
-        )
-
-    def test_start_timer_is_allowed_as_active_wakeup_confirmation(self) -> None:
+    def test_first_ordinary_call_confirms_active_wakeup_and_resets_timer(self) -> None:
         for wakeup_status in ("sending", "awaiting_confirmation"):
             with self.subTest(wakeup_status=wakeup_status):
                 self._reset_long_session_state()
@@ -233,24 +209,46 @@ class LongSessionTests(unittest.TestCase):
 
                 result = asyncio.run(
                     server.mcp.call_tool(
-                        "start_timer",
-                        {"conversation_url": url},
+                        "read_workspace_file",
+                        {"path": "mymcp/README.md", "conversation_url": url},
                     )
                 )
 
                 content, structured = result
-                self.assertEqual(structured["status"], "started")
-                self.assertTrue(structured["tracked"])
-                self.assertFalse(structured["timed_out"])
+                self.assertTrue(content[-1].text.startswith("LONG_SESSION_STATUS "))
+                self.assertTrue(structured["long_session"]["tracked"])
+                self.assertFalse(structured["long_session"]["timed_out"])
                 self.assertTrue(pending.cancelled)
                 self.assertEqual(
                     server._long_session_wakeup_results[url]["status"],
                     "confirmed",
                 )
 
+    def test_scheduled_wakeup_blocks_early_ordinary_call(self) -> None:
+        url = "https://chatgpt.com/c/wakeup-not-yet-sent"
+        pending = FakeTimer(60, lambda: None)
+        with server._long_session_lock:
+            server._long_session_wakeups[url] = pending
+            server._long_session_wakeup_results[url] = {
+                "status": "scheduled",
+                "kind": "agent_registered",
+                "retry_number": 0,
+            }
+        with patch.object(server, "_read_workspace_prefix") as read:
+            result = asyncio.run(
+                server.mcp.call_tool(
+                    "read_workspace_file",
+                    {"path": "mymcp/README.md", "conversation_url": url},
+                )
+            )
+        read.assert_not_called()
+        content, structured = result
+        self.assertIn("LONG_SESSION_WAKEUP_PENDING", content[0].text)
+        self.assertEqual(structured["status"], "blocked_wakeup_pending")
+        self.assertNotIn(url, server._long_session_started)
+
     def test_timeout_gate_does_not_schedule_duplicate_fallbacks(self) -> None:
         url = "https://chatgpt.com/c/single-fallback"
-        server.start_timer(url)
         with server._long_session_lock:
             server._long_session_started[url] = (
                 time.monotonic() - server.CONFIG.long_session_yield_after_seconds - 1
@@ -276,7 +274,6 @@ class LongSessionTests(unittest.TestCase):
 
     def test_agent_registered_wakeup_replaces_timeout_fallback(self) -> None:
         url = "https://chatgpt.com/c/control-after-timeout"
-        server.start_timer(url)
         with server._long_session_lock:
             server._long_session_started[url] = (
                 time.monotonic() - server.CONFIG.long_session_yield_after_seconds - 1
@@ -364,7 +361,6 @@ class LongSessionTests(unittest.TestCase):
                 patch.object(server, "CONFIG", test_config),
                 patch.object(server.threading, "Timer", FakeTimer),
             ):
-                server.start_timer(url)
                 asyncio.run(
                     server.mcp.call_tool(
                         "read_workspace_file",
@@ -449,7 +445,8 @@ class LongSessionTests(unittest.TestCase):
 
     def test_register_wakeup_clears_timer_and_schedules_configured_callback(self) -> None:
         url = "https://chatgpt.com/c/wakeup-test"
-        server.start_timer(url)
+        with server._long_session_lock:
+            server._long_session_started[url] = time.monotonic()
         with patch.object(server.threading, "Timer", FakeTimer):
             result = server.register_wakeup(url, prompt="continue exactly")
         self.assertEqual(result["status"], "scheduled")
@@ -549,11 +546,13 @@ class LongSessionTests(unittest.TestCase):
         self.assertTrue(events[-1]["long_retries_exhausted"])
         self.assertEqual(events[-1]["event"], "wakeup_failed")
 
-    def test_successful_long_retry_requires_start_timer_confirmation(self) -> None:
+    def test_successful_long_retry_requires_ordinary_call_confirmation(self) -> None:
         url = "https://chatgpt.com/c/long-retry-success"
 
         def send_and_confirm(*args, **kwargs):
-            server.start_timer(url)
+            status, transition = server._prepare_long_session_for_ordinary_call(url)
+            if transition != "resumed" or status["timed_out"]:
+                raise RuntimeError("ordinary MCP activity did not resume the wake-up")
             return {"status": "sent"}
 
         with patch.object(
@@ -652,7 +651,9 @@ class LongSessionTests(unittest.TestCase):
         url = "https://chatgpt.com/c/history-test"
 
         def send_and_confirm(*args, **kwargs):
-            server.start_timer(url)
+            status, transition = server._prepare_long_session_for_ordinary_call(url)
+            if transition != "resumed" or status["timed_out"]:
+                raise RuntimeError("ordinary MCP activity did not resume the wake-up")
             return {"status": "sent"}
 
         with patch.object(
@@ -670,7 +671,9 @@ class LongSessionTests(unittest.TestCase):
         self.assertEqual(kwargs["verification_markers"], (url,))
         self.assertNotIn("mcp_app_name", kwargs)
         rendered = send.call_args.args[0]
-        self.assertIn("start_timer", rendered)
+        self.assertNotIn("start_timer", rendered)
+        self.assertIn("first ordinary MCP tool call", rendered)
+        self.assertIn("conversation_url", rendered)
         self.assertIn(server.CONFIG.chatgpt_mcp_app_name, rendered)
         self.assertIn(url, rendered)
         self.assertIn("continue work", rendered)

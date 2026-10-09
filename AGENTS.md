@@ -86,7 +86,7 @@ When changing browser automation, preserve the separation between task acceptanc
 
 Long-session timing is server-authoritative.
 
-A conversation calls `start_timer` with its own ChatGPT conversation URL, then passes that URL on ordinary MCP calls. The server appends current timing status. Once `should_yield` becomes true, the agent should complete only the current atomic operation, persist enough state to resume safely, register a wake-up, and end the turn.
+A conversation passes its own ChatGPT conversation URL on ordinary MCP calls. The first such call implicitly starts long-session timing; later calls do not reset the timer. After a registered wake-up begins, the first ordinary MCP call carrying the same URL implicitly acknowledges the wake-up and restarts the timer. Once the server reports the time limit reached, the agent should complete only the current atomic operation, persist enough state to resume safely, register a wake-up, and end the turn.
 
 Do not replace this with model-side elapsed-time guesses.
 

@@ -78,6 +78,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    # Keep deterministic browser tests isolated from live slot reservations.
+    task_profiles_temp = tempfile.TemporaryDirectory(prefix="mymcp-test-task-profiles-")
+    chatgpt_playwright.TASK_PROFILES_ROOT = Path(task_profiles_temp.name)
     # Debug UI hold is an operator aid and must not slow deterministic tests.
     chatgpt_playwright.DEBUG_UI_HOLD_FILE = Path("/tmp/mymcp-debug-ui/test-hold-disabled")
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -115,8 +118,8 @@ def main() -> None:
         raise RuntimeError(f"completion sentinel was not detected: {result}")
     print("Playwright send and completion-sentinel flow: ok")
 
-    # Transaction-level browser semantics: retry only known pre-send failures and
-    # never retry an ambiguous click.
+    # Transaction-level browser semantics: one fresh source clone per attempt and
+    # never retry after a blocking interstitial or ambiguous click.
     Handler.completion_file = None
     retry_server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     retry_thread = threading.Thread(target=retry_server.serve_forever, daemon=True)
@@ -128,33 +131,39 @@ def main() -> None:
 
             interstitial_fill_calls = 0
 
-            def fail_interstitial_once(*args: object, **kwargs: object) -> None:
+            def fail_interstitial(*args: object, **kwargs: object) -> None:
                 nonlocal interstitial_fill_calls
                 interstitial_fill_calls += 1
-                if interstitial_fill_calls == 1:
-                    raise chatgpt_playwright.ChatGPTProfileInterstitialError(
-                        "synthetic blocking interstitial"
-                    )
-                original_fill(*args, **kwargs)
+                raise chatgpt_playwright.ChatGPTProfileInterstitialError(
+                    "synthetic blocking interstitial"
+                )
 
             with patch.object(
                 chatgpt_playwright,
                 "_fill_verified_prompt",
-                side_effect=fail_interstitial_once,
+                side_effect=fail_interstitial,
             ):
-                recovered = send_prompt(
-                    "browser marker",
-                    url=f"http://127.0.0.1:{retry_server.server_port}/?temporary-chat=true",
-                    profile_dir=profile,
-                    browser_channel="" if sys.platform == "linux" else "chrome",
-                    headless=True,
-                    timeout_seconds=10,
-                    verification_markers=("browser marker",),
-                )
-            if recovered["status"] != "sent" or interstitial_fill_calls != 2:
+                try:
+                    send_prompt(
+                        "browser marker",
+                        url=f"http://127.0.0.1:{retry_server.server_port}/?temporary-chat=true",
+                        profile_dir=profile,
+                        browser_channel="" if sys.platform == "linux" else "chrome",
+                        headless=True,
+                        timeout_seconds=10,
+                        verification_markers=("browser marker",),
+                    )
+                except chatgpt_playwright.ChatGPTPreSendError as error:
+                    if "synthetic blocking interstitial" not in str(error):
+                        raise RuntimeError(
+                            f"blocking interstitial lost its failure reason: {error}"
+                        ) from error
+                else:
+                    raise RuntimeError("blocking pre-send interstitial was unexpectedly retried")
+            if interstitial_fill_calls != 1:
                 raise RuntimeError(
-                    "blocking pre-send interstitial did not trigger exactly one profile "
-                    f"reseed retry: result={recovered}, calls={interstitial_fill_calls}"
+                    "blocking pre-send interstitial should fail after one fresh source clone; "
+                    f"calls={interstitial_fill_calls}"
                 )
 
             fill_calls = 0
@@ -308,22 +317,24 @@ def main() -> None:
                     raise RuntimeError("browser task did not use a bounded profile slot")
                 if not leased_profile.joinpath("Default", "Cookies").is_file():
                     raise RuntimeError("leased browser profile omitted session state")
-                leased_profile.joinpath("Default", "continuity-marker").write_text(
-                    "persistent", encoding="utf-8"
+                leased_profile.joinpath("Default", "task-only-marker").write_text(
+                    "disposable", encoding="utf-8"
                 )
-                leased_profile.joinpath("SingletonLock").write_text(
-                    "stale", encoding="utf-8"
-                )
-            if not leased_profile.exists():
-                raise RuntimeError("leased browser profile did not persist across tasks")
+            if leased_profile.exists():
+                raise RuntimeError("disposable browser profile survived task completion")
 
-            with chatgpt_playwright._browser_task_profile(source) as reused_profile:
-                if reused_profile != leased_profile:
-                    raise RuntimeError("browser slot did not preserve its browser identity")
-                if reused_profile.joinpath("SingletonLock").exists():
-                    raise RuntimeError("stale Chromium runtime lock survived profile reuse")
-                if not reused_profile.joinpath("Default", "continuity-marker").is_file():
-                    raise RuntimeError("persistent browser state was lost between tasks")
+            source.joinpath("Default", "source-refresh-marker").write_text(
+                "fresh", encoding="utf-8"
+            )
+            with chatgpt_playwright._browser_task_profile(source) as refreshed_profile:
+                if refreshed_profile != leased_profile:
+                    raise RuntimeError("browser task did not reuse its bounded slot path")
+                if refreshed_profile.joinpath("Default", "task-only-marker").exists():
+                    raise RuntimeError("fresh clone inherited state from the previous task clone")
+                if not refreshed_profile.joinpath("Default", "source-refresh-marker").is_file():
+                    raise RuntimeError("fresh clone did not reflect updated shared source state")
+            if refreshed_profile.exists():
+                raise RuntimeError("refreshed browser clone survived task completion")
 
             reservations: list[tuple[str, int]] = []
             for index in range(chatgpt_playwright.BROWSER_TASK_CONCURRENCY):

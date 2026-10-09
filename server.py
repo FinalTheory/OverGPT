@@ -146,9 +146,8 @@ def _long_session_stop_message(
         + "\nStop task work now. Do not call any further ordinary MCP tools. "
         "If the task needs continuation, call register_wakeup with this conversation URL exactly "
         f"once: {conversation_url}. That normal wake-up will replace the slower fallback. "
-        "If the task is complete, call end_timer instead. Only long-session control/debug tools "
-        "remain permitted. Then end this turn with a concise summary/checkpoint of the current "
-        "progress."
+        "If the task is complete, make no further MCP calls. Then end this turn with a concise "
+        "summary/checkpoint of the current progress."
     )
 
 
@@ -184,7 +183,7 @@ def _long_session_status(conversation_url: str | None) -> dict[str, Any]:
             "conversation_url": normalized,
             "timed_out": False,
             **({"last_wakeup": dict(last_wakeup)} if last_wakeup is not None else {}),
-            "message": "No active timer for this conversation; call start_timer before long-running work.",
+            "message": "No active timer for this conversation; the next ordinary MCP call will start one implicitly.",
         }
     elapsed = max(0.0, time.monotonic() - started)
     remaining = max(0.0, CONFIG.long_session_yield_after_seconds - elapsed)
@@ -205,11 +204,63 @@ def _long_session_status(conversation_url: str | None) -> dict[str, Any]:
     }
 
 
+def _prepare_long_session_for_ordinary_call(
+    conversation_url: str,
+) -> tuple[dict[str, Any], str | None]:
+    """Implicitly start or resume the long-session lease for one ordinary MCP call."""
+    transition: str | None = None
+    pending_kind: str | None = None
+    with _long_session_condition:
+        started = _long_session_started.get(conversation_url)
+        pending = _long_session_wakeups.get(conversation_url)
+        wakeup_result = dict(_long_session_wakeup_results.get(conversation_url, {}))
+        wakeup_status = wakeup_result.get("status")
+
+        if wakeup_status in {"sending", "awaiting_confirmation"}:
+            _long_session_wakeups.pop(conversation_url, None)
+            if pending is not None:
+                pending.cancel()
+            _long_session_started[conversation_url] = time.monotonic()
+            generation = _long_session_start_generation.get(conversation_url, 0) + 1
+            _long_session_start_generation[conversation_url] = generation
+            pending_kind = wakeup_result.get("kind")
+            confirmed = {
+                "status": "confirmed",
+                "kind": pending_kind,
+                "finished_at_epoch_seconds": time.time(),
+                "retry_number": wakeup_result.get("retry_number", 0),
+                "start_generation": generation,
+            }
+            if "browser_result" in wakeup_result:
+                confirmed["browser_result"] = wakeup_result["browser_result"]
+            _long_session_wakeup_results[conversation_url] = confirmed
+            _long_session_condition.notify_all()
+            transition = "resumed"
+        elif started is None:
+            if pending is not None:
+                transition = "wakeup_pending"
+            else:
+                _long_session_started[conversation_url] = time.monotonic()
+                transition = "started"
+
+    if transition in {"started", "resumed"}:
+        _append_long_session_event(
+            "timer_started",
+            conversation_url,
+            yield_after_seconds=CONFIG.long_session_yield_after_seconds,
+            implicit=True,
+            resume=(transition == "resumed"),
+            pending_wakeup_cancelled=(transition == "resumed" and pending is not None),
+            pending_wakeup_kind=pending_kind,
+        )
+    return _long_session_status(conversation_url), transition
+
+
 class LongSessionFastMCP(FastMCP):
     async def list_tools(self):
         tools = await super().list_tools()
         for tool in tools:
-            if tool.name in {"start_timer", "end_timer", "register_wakeup"}:
+            if tool.name == "register_wakeup":
                 continue
             properties = tool.inputSchema.setdefault("properties", {})
             properties.setdefault(
@@ -218,8 +269,9 @@ class LongSessionFastMCP(FastMCP):
                     "anyOf": [{"type": "string"}, {"type": "null"}],
                     "default": None,
                     "description": (
-                        "Optional current ChatGPT conversation URL. When supplied, the server "
-                        "returns authoritative long-session timing status for that conversation."
+                        "Optional current ChatGPT conversation URL. When supplied, the first "
+                        "ordinary MCP call implicitly starts long-session timing; after a wake-up, "
+                        "the first ordinary call implicitly resumes and acknowledges the session."
                     ),
                 },
             )
@@ -227,58 +279,10 @@ class LongSessionFastMCP(FastMCP):
 
     async def call_tool(self, name: str, arguments: dict[str, Any]):
         forwarded = dict(arguments)
-        control_tools = {"start_timer", "end_timer", "register_wakeup"}
-        if name in control_tools:
+        if name == "register_wakeup":
             conversation_url = forwarded.get("conversation_url")
             if conversation_url is not None:
-                conversation_url = _validate_conversation_url(conversation_url)
-                forwarded["conversation_url"] = conversation_url
-
-            if name == "start_timer" and conversation_url is not None:
-                current = _long_session_status(conversation_url)
-                if current.get("tracked") and current.get("timed_out"):
-                    with _long_session_lock:
-                        wakeup_pending = conversation_url in _long_session_wakeups
-                        wakeup_result = dict(
-                            _long_session_wakeup_results.get(conversation_url, {})
-                        )
-                    wakeup_authorized_restart = (
-                        wakeup_pending
-                        and wakeup_result.get("status")
-                        in {"sending", "awaiting_confirmation"}
-                    )
-                    if not wakeup_authorized_restart:
-                        fallback_wakeup = _ensure_timeout_fallback_wakeup(
-                            conversation_url
-                        )
-                        _append_long_session_event(
-                            "start_timer_blocked_timeout",
-                            conversation_url,
-                            fallback_scheduled_now=fallback_wakeup.get(
-                                "scheduled_now", False
-                            ),
-                            fallback_delay_seconds=fallback_wakeup.get(
-                                "delay_seconds"
-                            ),
-                        )
-                        stop_text = _long_session_stop_message(
-                            conversation_url,
-                            tool_name=name,
-                            completed_before_timeout_check=False,
-                            fallback_wakeup=fallback_wakeup,
-                        )
-                        return (
-                            [TextContent(type="text", text=stop_text)],
-                            {
-                                "status": "blocked_timeout",
-                                "executed": False,
-                                "tool_name": name,
-                                "message": stop_text,
-                                "long_session": current,
-                                "fallback_wakeup": fallback_wakeup,
-                            },
-                        )
-
+                forwarded["conversation_url"] = _validate_conversation_url(conversation_url)
             return await super().call_tool(name, forwarded)
 
         conversation_url = forwarded.pop("conversation_url", None)
@@ -286,7 +290,27 @@ class LongSessionFastMCP(FastMCP):
             return await super().call_tool(name, forwarded)
         conversation_url = _validate_conversation_url(conversation_url)
 
-        before = _long_session_status(conversation_url)
+        before, transition = _prepare_long_session_for_ordinary_call(conversation_url)
+        if transition == "wakeup_pending":
+            pending = before.get("last_wakeup", {})
+            text = (
+                "LONG_SESSION_WAKEUP_PENDING\n"
+                "A wake-up is already scheduled for this conversation, so this ordinary MCP "
+                "tool was NOT executed. Stop task work and end this turn; the scheduled wake-up "
+                "will resume the session."
+            )
+            return (
+                [TextContent(type="text", text=text)],
+                {
+                    "status": "blocked_wakeup_pending",
+                    "executed": False,
+                    "tool_name": name,
+                    "message": text,
+                    "long_session": before,
+                    "wakeup": pending,
+                },
+            )
+
         if before.get("tracked"):
             _append_long_session_event(
                 "tool_call_requested",
@@ -416,24 +440,24 @@ mcp = LongSessionFastMCP(
         "seconds, returning sooner when the task finishes. If a task fails or times out, read "
         "its returned stderr_path with the workspace file tools for diagnostics. "
         "Model execution time is bounded. If you know the URL of your current ChatGPT "
-        "conversation and expect to do substantial multi-step work, call start_timer with that "
-        "URL before beginning. Delegated temporary-chat sub-agents created by "
-        "spawn_chatgpt_subagents do not participate in this protocol unless they are explicitly "
-        "given their own existing conversation URL. Pass the same conversation_url on subsequent "
-        "ordinary MCP tool calls. While the timer is within budget, the server appends authoritative "
-        "LONG_SESSION_STATUS with elapsed and remaining time. Once the time limit has already been "
-        "reached, ordinary MCP tools are not executed; the server returns a plain stop directive "
-        "requiring the agent to stop task work and end the turn. At the same time, the server "
-        f"automatically ensures a safety-net wake-up exists for {CONFIG.long_session_timeout_fallback_delay_seconds} "
-        "seconds later. A tool that started before the limit may finish atomically, but if it "
-        "crosses the limit its result includes the same stop directive and the fallback is ensured "
-        "before returning. Only register_wakeup and end_timer remain available for long-session "
-        "control after timeout. The agent should still call register_wakeup "
-        "when continuation is needed: it clears the expired timer, cancels/replaces the slower "
-        f"fallback, and schedules the normal continuation after {CONFIG.long_session_wakeup_delay_seconds} "
-        "seconds. When work finishes normally, "
-        "call end_timer. Never estimate the remaining execution budget yourself when server "
-        "timing is available."
+        "conversation, pass that conversation_url on ordinary MCP tool calls. The first such call "
+        "implicitly starts long-session timing; later ordinary calls do not reset the timer. "
+        "Delegated temporary-chat sub-agents created by spawn_chatgpt_subagents do not participate "
+        "in this protocol unless they are explicitly given their own existing conversation URL. "
+        "While the timer is within budget, the server appends authoritative LONG_SESSION_STATUS "
+        "with elapsed and remaining time. Once the time limit has already been reached, ordinary "
+        "MCP tools are not executed; the server returns a stop directive requiring the agent to "
+        "stop task work and end the turn. At the same time, the server automatically ensures a "
+        f"safety-net wake-up exists for {CONFIG.long_session_timeout_fallback_delay_seconds} seconds "
+        "later. A tool that started before the limit may finish atomically, but if it crosses the "
+        "limit its result includes the same stop directive and the fallback is ensured before "
+        "returning. When continuation is needed, call register_wakeup: it clears the expired timer, "
+        "cancels/replaces the slower fallback, and schedules the normal continuation after "
+        f"{CONFIG.long_session_wakeup_delay_seconds} seconds. After the wake-up message starts, the "
+        "first ordinary MCP call carrying the same conversation_url atomically acknowledges the "
+        "wake-up and restarts the timer. When work finishes normally, make no further long-session "
+        "control calls. Never estimate the remaining execution budget yourself when server timing "
+        "is available."
     ),
     host=CONFIG.host,
     port=CONFIG.port,
@@ -566,7 +590,7 @@ def _schedule_wakeup_send_retry(
         owner = threading.current_thread()
         current = _long_session_wakeups.get(conversation_url)
         if isinstance(owner, threading.Timer):
-            # A newer register_wakeup/end_timer may have replaced or removed this
+            # A newer register_wakeup or implicit resume may have replaced or removed this
             # callback while browser automation was running. Never resurrect it.
             if current is not owner:
                 return False
@@ -603,7 +627,7 @@ def _wait_for_wakeup_confirmation(
     baseline_generation: int,
     timeout_seconds: int,
 ) -> bool:
-    """Wait until this conversation calls start_timer after one wake-up attempt."""
+    """Wait until this conversation makes an ordinary MCP call after one wake-up attempt."""
     deadline = time.monotonic() + timeout_seconds
     with _long_session_condition:
         while _long_session_start_generation.get(conversation_url, 0) <= baseline_generation:
@@ -621,9 +645,9 @@ def _send_registered_wakeup(
 ) -> None:
     rendered_prompt = (
         f"Conversation URL: {conversation_url}\n"
-        f"The connected MCP app is {CONFIG.chatgpt_mcp_app_name}. Before doing any other "
-        "MCP work, call its start_timer tool with the conversation URL above. Only after "
-        "that call succeeds, continue the previous task.\n\n"
+        f"The connected MCP app is {CONFIG.chatgpt_mcp_app_name}. Continue the previous task. "
+        "On your first ordinary MCP tool call, pass the conversation URL above as conversation_url; "
+        "that call will acknowledge this wake-up and restart the long-session timer automatically.\n\n"
         f"{prompt}"
     )
     with _long_session_lock:
@@ -698,7 +722,7 @@ def _send_registered_wakeup(
         )
         if not confirmed:
             raise TimeoutError(
-                "wakeup message was submitted but start_timer was not called within "
+                "wakeup message was submitted but no ordinary MCP call acknowledged it within "
                 f"{CONFIG.long_session_wakeup_confirmation_timeout_seconds} seconds"
             )
 
@@ -778,81 +802,6 @@ def _send_registered_wakeup(
             current = _long_session_wakeups.get(conversation_url)
             if current is threading.current_thread():
                 _long_session_wakeups.pop(conversation_url, None)
-
-
-@mcp.tool()
-def start_timer(conversation_url: str) -> dict[str, Any]:
-    """Start or restart server-authoritative long-session timing for one ChatGPT conversation."""
-    normalized = _validate_conversation_url(conversation_url)
-    with _long_session_condition:
-        _long_session_started[normalized] = time.monotonic()
-        generation = _long_session_start_generation.get(normalized, 0) + 1
-        _long_session_start_generation[normalized] = generation
-        pending = _long_session_wakeups.pop(normalized, None)
-        pending_result = dict(_long_session_wakeup_results.get(normalized, {}))
-        pending_kind = pending_result.get("kind") if pending is not None else None
-        if pending is not None:
-            pending.cancel()
-            if pending_result.get("status") in {
-                "sending",
-                "awaiting_confirmation",
-            }:
-                _long_session_wakeup_results[normalized] = {
-                    "status": "confirmed",
-                    "kind": pending_kind,
-                    "finished_at_epoch_seconds": time.time(),
-                    "retry_number": pending_result.get("retry_number", 0),
-                    "start_generation": generation,
-                }
-            else:
-                _long_session_wakeup_results[normalized] = {
-                    "status": "cancelled_by_start_timer",
-                    "kind": pending_kind,
-                    "finished_at_epoch_seconds": time.time(),
-                }
-        _long_session_condition.notify_all()
-    _append_long_session_event(
-        "timer_started",
-        normalized,
-        yield_after_seconds=CONFIG.long_session_yield_after_seconds,
-        pending_wakeup_cancelled=pending is not None,
-        pending_wakeup_kind=pending_kind,
-    )
-    return {
-        "status": "started",
-        **_long_session_status(normalized),
-    }
-
-
-@mcp.tool()
-def end_timer(conversation_url: str) -> dict[str, Any]:
-    """End long-session timing and cancel any pending wakeup for one conversation."""
-    normalized = _validate_conversation_url(conversation_url)
-    with _long_session_lock:
-        existed = _long_session_started.pop(normalized, None) is not None
-        pending = _long_session_wakeups.pop(normalized, None)
-        pending_result = dict(_long_session_wakeup_results.get(normalized, {}))
-        pending_kind = pending_result.get("kind") if pending is not None else None
-        if pending is not None:
-            pending.cancel()
-            _long_session_wakeup_results[normalized] = {
-                "status": "cancelled_by_end_timer",
-                "kind": pending_kind,
-                "finished_at_epoch_seconds": time.time(),
-            }
-    _append_long_session_event(
-        "timer_ended",
-        normalized,
-        timer_existed=existed,
-        wakeup_cancelled=pending is not None,
-        wakeup_kind=pending_kind,
-    )
-    return {
-        "status": "ended",
-        "conversation_url": normalized,
-        "timer_existed": existed,
-        "wakeup_cancelled": pending is not None,
-    }
 
 
 @mcp.tool()
