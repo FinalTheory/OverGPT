@@ -709,7 +709,7 @@ def main() -> None:
             raise RuntimeError("sub-agent output was pre-created")
         if delegated.get("browser_slot") is not None:
             raise RuntimeError("Codex-first spawn path reserved a browser slot eagerly")
-        if delegated.get("backend_policy") != "codex_then_browser":
+        if delegated.get("backend_policy") != "auto":
             raise RuntimeError(f"unexpected backend policy: {delegated}")
         if (
             delegated["status"] != "started"
@@ -731,7 +731,7 @@ def main() -> None:
                 "task_id": "task_" + ch * 32,
                 "status": "queued",
                 "output_path": f"mymcp/task_state/{ch * 32}/output.md",
-                "backend_policy": "codex_then_browser",
+                "backend_policy": "auto",
             }
             for ch in ("a", "b", "c", "e")
         ]
@@ -745,6 +745,31 @@ def main() -> None:
             raise RuntimeError(f"Codex batch was incorrectly browser-limited: {batch}")
         if mocked_unbounded_batch.call_count != 4:
             raise RuntimeError("Codex batch did not launch every requested task")
+
+        if any(call.args[1] != "auto" for call in mocked_unbounded_batch.call_args_list):
+            raise RuntimeError("default sub-agent backend was not propagated as auto")
+
+        with patch.object(
+            server, "_spawn_one_subagent", return_value=started_items[0]
+        ) as mocked_forced_browser:
+            forced_browser_batch = server.spawn_chatgpt_subagents(
+                ["forced browser task"], backend="browser"
+            )
+        mocked_forced_browser.assert_called_once_with("forced browser task", "browser")
+        if forced_browser_batch.get("backend_policy") != "browser":
+            raise RuntimeError(
+                f"forced browser policy was not surfaced: {forced_browser_batch}"
+            )
+
+        with patch.object(server, "_spawn_one_subagent") as mocked_invalid_backend:
+            try:
+                server.spawn_chatgpt_subagents(["task"], backend="invalid")
+            except ValueError:
+                pass
+            else:
+                raise RuntimeError("invalid sub-agent backend was accepted")
+        if mocked_invalid_backend.called:
+            raise RuntimeError("invalid backend produced side effects before rejection")
 
         with patch.object(server, "_spawn_one_subagent") as mocked_invalid_batch:
             try:
@@ -819,6 +844,51 @@ def main() -> None:
             raise RuntimeError("Codex preflight failure did not select browser fallback")
         reserve_browser.assert_called_once()
         browser_send.assert_called_once()
+
+        # Forced browser selection must not touch Codex discovery or preflight.
+        with (
+            patch.object(subagent_backend, "CONFIG", backend_config),
+            patch.object(subagent_backend, "_resolve_codex_binary") as resolve_codex,
+            patch.object(subagent_backend, "_codex_preflight") as codex_preflight,
+            patch.object(subagent_backend, "reserve_browser_slot", return_value=2) as reserve_browser,
+            patch.object(
+                subagent_backend,
+                "send_subagent_task",
+                return_value={"status": "completed"},
+            ) as browser_send,
+        ):
+            selected = subagent_backend.run_subagent_task(
+                backend_input, backend_output, backend="browser"
+            )
+        if selected["backend"] != "chatgpt_browser_fallback":
+            raise RuntimeError("forced browser backend did not select browser")
+        if resolve_codex.called or codex_preflight.called:
+            raise RuntimeError("forced browser backend touched Codex")
+        reserve_browser.assert_called_once()
+        browser_send.assert_called_once()
+
+        # Forced Codex selection must fail closed instead of falling back to browser.
+        with (
+            patch.object(subagent_backend, "CONFIG", backend_config),
+            patch.object(subagent_backend, "_resolve_codex_binary", return_value="/fake/codex"),
+            patch.object(
+                subagent_backend,
+                "_codex_preflight",
+                side_effect=subagent_backend.CodexPreflightError("quota unavailable"),
+            ),
+            patch.object(subagent_backend, "reserve_browser_slot") as reserve_browser,
+        ):
+            try:
+                subagent_backend.run_subagent_task(
+                    backend_input, backend_output, backend="codex"
+                )
+            except RuntimeError as error:
+                if "forced Codex backend is unavailable" not in str(error):
+                    raise
+            else:
+                raise RuntimeError("forced Codex preflight failure was hidden")
+        if reserve_browser.called:
+            raise RuntimeError("forced Codex backend fell back to browser")
 
         # Once the real Codex task begins, later failure must not duplicate side effects via browser.
         with (

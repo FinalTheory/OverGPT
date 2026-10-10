@@ -78,7 +78,7 @@ A delegated task communicates through persistent workspace files:
 - stdout/stderr are execution logs, not result channels.
 - completion is recognized through the fixed sentinel protocol.
 
-The preferred backend is Codex CLI. Each task performs a read-only Codex availability preflight before executing the real task. Healthy Codex tasks do not reserve browser slots and are not subject to browser concurrency limits. If the preflight fails before user-task execution begins, the worker may fall back to the ChatGPT Web backend, which retains the bounded browser-slot/profile semantics.
+`spawn_chatgpt_subagents` accepts `backend="auto" | "codex" | "browser"`. `auto` is Codex-first: each task performs a read-only Codex availability preflight before executing the real task, then falls back to ChatGPT Web only if that preflight fails. `codex` forces Codex and fails closed when unavailable; `browser` skips Codex entirely and forces the bounded ChatGPT Web backend. Healthy Codex tasks do not reserve browser slots and are not subject to browser concurrency limits.
 
 Never fall back to the browser after the real Codex task has started: Codex may already have changed workspace state, so a second execution would create duplicate side effects.
 

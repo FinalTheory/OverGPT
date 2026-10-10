@@ -101,7 +101,7 @@ A long logical task can therefore span multiple ChatGPT turns without pretending
 
 OverGPT can launch isolated delegated workers with fresh execution context.
 
-Each delegated task gets explicit input, persistent output, and durable task state. The preferred backend is Codex CLI; a read-only preflight checks authentication/model/service availability before the real task starts. If that preflight is unavailable, the task can fall back to the bounded ChatGPT Web browser backend. The parent receives a task ID immediately and can keep working while the child runs independently.
+Each delegated task gets explicit input, persistent output, and durable task state. `spawn_chatgpt_subagents` accepts `backend="auto"`, `"codex"`, or `"browser"`. `auto` is Codex-first and falls back to the bounded ChatGPT Web backend only when the read-only Codex availability preflight fails; `codex` and `browser` are strict selections with no cross-fallback. The parent receives a task ID immediately and can keep working while the child runs independently.
 
 ```text
                     parent ChatGPT

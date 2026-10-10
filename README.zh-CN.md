@@ -101,7 +101,7 @@ OverGPT 随后会向同一个对话发送继续执行的消息。
 
 OverGPT 可以启动相互隔离的 delegated worker。
 
-每个委派任务都有明确的输入、持久化输出和 durable task state。首选 backend 是 Codex CLI：真正执行任务之前先通过只读 preflight 检查认证、模型和服务是否可用；如果 preflight 不可用，则退回到受浏览器执行槽限制的 ChatGPT Web backend。父代理会立即拿到 task ID，因此可以在子任务独立运行时继续自己的工作。
+每个委派任务都有明确的输入、持久化输出和 durable task state。`spawn_chatgpt_subagents` 支持 `backend="auto"`、`"codex"`、`"browser"` 三种模式：`auto` 先做只读 Codex availability preflight，失败时才退回受浏览器执行槽限制的 ChatGPT Web backend；`codex` 和 `browser` 都是强制选择，不会跨 backend fallback。父代理会立即拿到 task ID，因此可以在子任务独立运行时继续自己的工作。
 
 ```text
                     父 ChatGPT

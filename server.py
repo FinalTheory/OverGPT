@@ -429,11 +429,13 @@ mcp = LongSessionFastMCP(
         "shell rm/mv. Use run_workspace_code(background=true) for "
         "long-running commands, then poll get_workspace_task with the returned task_id; background "
         "commands default to a one-hour timeout. Delegate independent sub-agents through "
-        "spawn_chatgpt_subagents. The preferred backend is Codex CLI; Codex tasks do not consume "
-        "browser slots or participate in the browser concurrency limit. Each task performs a "
-        "read-only Codex availability preflight before executing the real task. If that preflight "
-        "fails, the task may fall back to the bounded ChatGPT Web backend. Preserve each returned "
-        "output_path as the sub-agent's result file; stdout_path and stderr_path are execution "
+        "spawn_chatgpt_subagents. Pass backend='auto' for Codex-first execution with browser "
+        "fallback, backend='codex' to force Codex, or backend='browser' to force Playwright. Codex "
+        "tasks do not consume browser slots or participate in the browser concurrency limit. In "
+        "auto mode each task performs a read-only Codex availability preflight before executing "
+        "the real task; only a failed preflight may fall back to the bounded ChatGPT Web backend. "
+        "Preserve each returned output_path as the sub-agent's result file; stdout_path and "
+        "stderr_path are execution "
         "logs. Call get_workspace_task with its defaults: it waits server-side for up to 30 "
         "seconds, returning sooner when the task finishes. If a task fails or times out, read "
         "its returned stderr_path with the workspace file tools for diagnostics. "
@@ -991,13 +993,20 @@ def _render_chatgpt_subagent_prompt(input_path: str, output_path: str) -> str:
     )
 
 
-def _subagent_task_code(input_path: str, output_path: str) -> str:
+def _subagent_task_code(
+    input_path: str,
+    output_path: str,
+    backend: Literal["auto", "codex", "browser"] = "auto",
+) -> str:
     return "\n".join(
         [
             "import sys",
             f"sys.path.insert(0, {str(CONFIG.project_root)!r})",
             "from subagent_backend import run_subagent_task",
-            f"result = run_subagent_task({input_path!r}, {output_path!r})",
+            (
+                "result = run_subagent_task("
+                f"{input_path!r}, {output_path!r}, backend={backend!r})"
+            ),
             "print(result)",
         ]
     )
@@ -2063,8 +2072,11 @@ def _validate_subagent_task(task: str) -> None:
         raise ValueError(f"task exceeds the {CONFIG.max_read_chars} character limit")
 
 
-def _spawn_one_subagent(task: str) -> dict[str, Any]:
-    """Start one already-validated delegated task with Codex-first backend selection."""
+def _spawn_one_subagent(
+    task: str,
+    backend: Literal["auto", "codex", "browser"],
+) -> dict[str, Any]:
+    """Start one already-validated delegated task with explicit backend policy."""
     task_id, task_dir = _reserve_workspace_task_dir()
     relative_task_dir = task_dir.relative_to(CONFIG.workspace_root).as_posix()
     normalized_input = f"{relative_task_dir}/input.md"
@@ -2073,7 +2085,7 @@ def _spawn_one_subagent(task: str) -> dict[str, Any]:
         _write_text_atomic(task_dir / "input.md", task)
         result = _start_workspace_task(
             "python",
-            _subagent_task_code(normalized_input, normalized_output),
+            _subagent_task_code(normalized_input, normalized_output, backend),
             CONFIG.workspace_root,
             ".",
             CONFIG.max_background_timeout_seconds,
@@ -2083,7 +2095,7 @@ def _spawn_one_subagent(task: str) -> dict[str, Any]:
                 "kind": "subagent",
                 "input_path": normalized_input,
                 "output_path": normalized_output,
-                "backend_policy": "codex_then_browser",
+                "backend_policy": backend,
             },
         )
     except BaseException:
@@ -2093,22 +2105,28 @@ def _spawn_one_subagent(task: str) -> dict[str, Any]:
         **result,
         "input_path": normalized_input,
         "output_path": normalized_output,
-        "backend_policy": "codex_then_browser",
+        "backend_policy": backend,
         "completion": "task-owned final output file plus completion sentinel",
         "message": "Sub-agent queued; poll get_workspace_task with task_id.",
     }
 
 
 @mcp.tool()
-def spawn_chatgpt_subagents(tasks: list[str]) -> dict[str, Any]:
-    """Start independent delegated tasks using Codex first and ChatGPT Web as fallback.
+def spawn_chatgpt_subagents(
+    tasks: list[str],
+    backend: Literal["auto", "codex", "browser"] = "auto",
+) -> dict[str, Any]:
+    """Start independent delegated tasks with a selectable execution backend.
 
-    Codex tasks do not consume browser slots and are not subject to browser concurrency
-    limits. If Codex availability preflight fails, that task may fall back to the bounded
-    ChatGPT Web backend.
+    backend="auto" prefers Codex and falls back to ChatGPT Web only when Codex
+    availability preflight fails. backend="codex" forces Codex with no browser
+    fallback. backend="browser" skips Codex and forces the bounded Playwright
+    backend. Codex tasks do not consume browser slots.
     """
     if not isinstance(tasks, list) or not tasks:
         raise ValueError("tasks must be a non-empty list of task strings")
+    if backend not in {"auto", "codex", "browser"}:
+        raise ValueError("backend must be one of: auto, codex, browser")
 
     # Validate the complete request before any side effect.
     for task in tasks:
@@ -2122,7 +2140,7 @@ def spawn_chatgpt_subagents(tasks: list[str]) -> dict[str, Any]:
             items.append({"index": index, "status": stop_reason, "task_id": None})
             continue
         try:
-            result = _spawn_one_subagent(task)
+            result = _spawn_one_subagent(task, backend)
         except Exception as exc:
             if started == 0:
                 raise
@@ -2159,7 +2177,7 @@ def spawn_chatgpt_subagents(tasks: list[str]) -> dict[str, Any]:
         "status": batch_status,
         "requested": len(tasks),
         "started": started,
-        "backend_policy": "codex_then_browser",
+        "backend_policy": backend,
         "items": items,
         "message": (
             "Batch launch completed; preserve task_id/output_path from every "

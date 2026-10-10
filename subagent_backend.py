@@ -188,8 +188,20 @@ def _run_codex_subagent(
     }
 
 
-def run_subagent_task(input_path: str, output_path: str) -> dict[str, Any]:
-    """Run Codex when available; otherwise fall back to the browser backend."""
+def run_subagent_task(
+    input_path: str,
+    output_path: str,
+    backend: str = "auto",
+) -> dict[str, Any]:
+    """Run one delegated task using the requested backend policy.
+
+    ``auto`` prefers Codex and falls back to ChatGPT Web only when Codex cannot
+    prove availability before task execution. ``codex`` and ``browser`` are
+    strict selections and never cross-fallback to the other backend.
+    """
+    if backend not in {"auto", "codex", "browser"}:
+        raise ValueError("backend must be one of: auto, codex, browser")
+
     normalized_input = normalize_workspace_relative_path(input_path)
     normalized_output = normalize_workspace_relative_path(output_path)
     if normalized_input == normalized_output:
@@ -202,11 +214,15 @@ def run_subagent_task(input_path: str, output_path: str) -> dict[str, Any]:
     )
     task_dir = input_file.parent
 
-    if CONFIG.codex_subagent_enabled:
+    if backend in {"auto", "codex"} and CONFIG.codex_subagent_enabled:
         try:
             binary = _resolve_codex_binary()
             _codex_preflight(binary, task_dir)
         except CodexPreflightError as error:
+            if backend == "codex":
+                raise RuntimeError(
+                    f"forced Codex backend is unavailable: {error}"
+                ) from error
             print(
                 f"Codex preflight unavailable ({error}); trying ChatGPT Web fallback.",
                 file=sys.stderr,
@@ -215,8 +231,12 @@ def run_subagent_task(input_path: str, output_path: str) -> dict[str, Any]:
             return _run_codex_subagent(
                 binary, normalized_input, normalized_output, task_dir
             )
+    elif backend == "codex":
+        raise RuntimeError("forced Codex backend is disabled by configuration")
 
     if not CONFIG.chatgpt_automation_enabled:
+        if backend == "browser":
+            raise RuntimeError("forced browser backend is disabled by configuration")
         raise RuntimeError(
             "Codex is unavailable and ChatGPT browser fallback is disabled"
         )
@@ -236,9 +256,17 @@ def run_subagent_task(input_path: str, output_path: str) -> dict[str, Any]:
 
 
 def main() -> None:
-    if len(sys.argv) != 3:
-        raise SystemExit("usage: subagent_backend.py <input_path> <output_path>")
-    print(json.dumps(run_subagent_task(sys.argv[1], sys.argv[2]), ensure_ascii=False))
+    if len(sys.argv) not in {3, 4}:
+        raise SystemExit(
+            "usage: subagent_backend.py <input_path> <output_path> [auto|codex|browser]"
+        )
+    backend = sys.argv[3] if len(sys.argv) == 4 else "auto"
+    print(
+        json.dumps(
+            run_subagent_task(sys.argv[1], sys.argv[2], backend=backend),
+            ensure_ascii=False,
+        )
+    )
 
 
 if __name__ == "__main__":
